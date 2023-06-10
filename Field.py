@@ -13,9 +13,9 @@ class Field:
         self._add_projection = None
         self._einsum = None
         self._make_conv = None
-        self._make_concat = None
         self._make_divide = None
         self._make_add = None
+        self._concat_allowances = []
 
         self._field_shift_allowances = None
         self._projection_allowances = None
@@ -25,6 +25,7 @@ class Field:
         self._elementwise_allowances = None
         self._einsum_allowances_with = dict()
         self.einsum_string_dict = dict()
+        self._concat_to_allowances = dict()
 
     @property
     def field_index(self):
@@ -77,29 +78,15 @@ class Field:
     def make_conv(self, value):
         self._make_conv = value
 
-    @property
-    def make_concat(self):
-        return self._make_concat
-
-    @make_concat.setter
-    def make_concat(self, value):
-        self._make_concat = value
 
     @property
     def make_divide(self):
         return self._make_divide
 
-    @make_divide.setter
-    def make_divide(self, value):
-        self._make_divide = value
-
     @property
     def make_add(self):
         return self._make_add
 
-    @make_add.setter
-    def make_add(self, value):
-        self._make_add = value
 
     def softmax(self, cell_op_state):
         cell_op_state[self._field_index] = tf.nn.softmax(cell_op_state[self._field_index], axis=-1)
@@ -112,15 +99,18 @@ class Field:
     def einsum_allowances_with(self):
         return self._einsum_allowances_with
 
+    def concat_to_allowances(self, with_index):
+        return self._concat_to_allowances[with_index]
+
     def build_field_shift_ops(self, fields):
         this_shape_prod = int(np.prod(self._shape))
         fields_compatible = tuple(
             int(np.prod(field.shape)) == this_shape_prod and field.field_index != self._field_index for field in fields
         )
-        self._dimensional_shift = (
+        self._dimensional_shift = tuple(
             self.build_field_shift_op(field) if fields_compatible[field.field_index] else None for field in fields
         )
-        self._field_shift_allowances = (1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
+        self._field_shift_allowances = tuple(1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
 
     def build_field_shift_op(self, field):
         field_index = self._field_index
@@ -133,10 +123,10 @@ class Field:
         fields_compatible = tuple(
             len(field.shape) == len(self._shape) and field.shape[-1] == self._shape[-1] and field.field_index != self._field_index for field in fields
         )
-        self._add_projection = (
+        self._add_projection = tuple(
             self.build_projection_op(field) if fields_compatible[field.field_index] else None for field in fields
         )
-        self._projection_allowances = (1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
+        self._projection_allowances = tuple(1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
 
     def build_projection_op(self, field):
         field_index = self._field_index
@@ -146,7 +136,8 @@ class Field:
         w_2 = tf.random.normal([32, field.shape[-1]], seed=65)
         b_2 = tf.random.normal([field.shape[-1]], seed=65)
         def projection_op_generator(projection_key):
-            indices = tf.matmul(tf.nn.relu(tf.matmul(projection_key, w_1) + b_1), w_2) + b_2
+            projection_key_matrix = tf.reshape(projection_key, [1, -1])
+            indices = tf.matmul(tf.nn.relu(tf.matmul(projection_key_matrix, w_1) + b_1), w_2) + b_2
             def projection_op(cell_op_state):
                 cell_op_state[other_index] = tf.gather(cell_op_state[field_index], indices, axis=-1)
             return projection_op
@@ -154,35 +145,47 @@ class Field:
 
     def build_conv_ops(self, fields):
         fields_compatible = tuple(
-            len(field.shape) == len(self._shape) and field.field_index != self._field_index for field in fields
+            len(field.shape) == 3 for field in fields
         )
 
         self._make_conv = tuple(self.build_conv_op(field) if these_fields_compatible else None
                                 for these_fields_compatible, field in zip(fields_compatible, fields))
-        self._conv_allowances = (1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
+        self._conv_allowances = tuple(1.0 if field_compatible else 0.0 for field_compatible in fields_compatible)
 
     def generate_conv_params(self, other_field):
-        # define parameters for convolution
-        conv_filter_shape = [3, 3, self._shape[-1], other_field.shape[-1]]
-        seed = 42
 
-        # generate random filter weights and biases
-        filter_weights = tf.random.normal(conv_filter_shape, seed=seed)
-        filter_biases = tf.random.normal([other_field.shape[-1]], seed=seed)
+        kernel_gen_w_1 = tf.random.normal([8, 32], seed=67)
+        kernel_gen_b_1 = tf.random.normal([32], seed=67)
+        kernel_gen_w_2 = tf.random.normal([32, 5, 5, self._shape[-1], other_field.shape[-1]], seed=67)
+        kernel_gen_b_2 = tf.random.normal([5, 5, self._shape[-1], other_field.shape[-1]], seed=67)
+        kernel_gen = lambda kernel_key: tf.einsum('di,iklft->dklft',tf.nn.relu(tf.matmul(kernel_key, kernel_gen_w_1) + kernel_gen_b_1),
+                  kernel_gen_w_2)[0,:] + kernel_gen_b_2
+
+        bias_gen_w_1 = tf.random.normal([8, 32], seed=67)
+        bias_gen_b_1 = tf.random.normal([32], seed=67)
+        bias_gen_w_2 = tf.random.normal([32, other_field.shape[-1]], seed=67)
+        bias_gen_b_2 = tf.random.normal([other_field.shape[-1]], seed=67)
+        bias_gen = lambda kernel_key: tf.matmul(tf.nn.relu(tf.matmul(kernel_key, bias_gen_w_1) + bias_gen_b_1),
+                  bias_gen_w_2)[0,:] + bias_gen_b_2
 
         # return parameters as a tuple
-        return filter_weights, filter_biases, other_field.field_index
+        return kernel_gen, bias_gen, other_field.field_index
 
     def build_conv_op(self, other_field):
-        filter_weights, filter_biases, other_index = self.generate_conv_params(other_field)
+        kernel_gen, bias_gen, other_index = self.generate_conv_params(other_field)
 
-        def conv_op(cell_op_state):
-            conv_output = tf.nn.conv2d(cell_op_state[self._field_index], filter_weights, strides=[1, 1, 1, 1],
-                                       padding='SAME')
-            conv_output = tf.nn.bias_add(conv_output, filter_biases)
-            cell_op_state[other_index] = conv_output
+        def conv_op_generator(conv_gen_key):
+            conv_key_matrix = tf.reshape(conv_gen_key, [1, -1])
+            kernel_key, bias_key = tf.split(conv_key_matrix, 2, axis=1)
+            kernel = kernel_gen(kernel_key)
+            bias = bias_gen(bias_key)
+            def conv_op(cell_op_state):
+                conv_output = tf.nn.conv2d(cell_op_state[self._field_index], kernel, strides=[1, 1, 1, 1],
+                                           padding='SAME')
+                conv_output = tf.nn.bias_add(conv_output, bias)
+                cell_op_state[other_index] = conv_output
 
-        return conv_op
+        return conv_op_generator
 
     def field_compatible_for_einsum(self, other, ecosystem_fields):
         self_dims = len(self._shape)
@@ -238,6 +241,8 @@ class Field:
                 self.einsum_string_dict[field_index] = field_einsum_compatability_props[2]
                 self.einsum_allowances_with[field_index] = field_einsum_compatability_props[1]
 
+        self._einsum_allowances = tuple(1.0 if compatible else 0.0 for compatible, _, _, _ in einsum_compatability_props)
+
     @property
     def projection_allowances(self):
         return self._projection_allowances
@@ -264,7 +269,7 @@ class Field:
                 this_dim_size == other_dim_size for this_dim_size, other_dim_size in zip(self._shape, other.shape)
             ) for other in fields]
 
-        self._elementwise_allowances = [1.0 if compatible else 0 for compatible in elementwise_compatible]
+        self._elementwise_allowances = tuple(1.0 if compatible else 0 for compatible in elementwise_compatible)
         self._make_add = [self.build_add_op(other) if compatible else None
                          for other, compatible in zip(fields, elementwise_compatible)]
         self._make_divide = [self.build_divide_op(other) if compatible else None
@@ -285,8 +290,64 @@ class Field:
 
         return divide_op
 
+    def build_concat_ops(self, fields):
+        compatabilities = [self.check_concat_compatibility(field, fields) for field in fields]
+        self._concat_allowances = tuple(1.0 if compatability[0] else 0.0 for compatability in compatabilities)
+
+        for field_index, compatability in enumerate(compatabilities):
+            if compatability[0]:
+                self._concat_to_allowances[field_index] = compatability[1]
+
+
+    def check_concat_compatibility(self, other_field, ecosystem_fields):
+        if len(self._shape) == len(other_field.shape) and all(this_shape == other_shape for this_shape, other_shape in zip(self._shape, other_field.shape)):
+            result_shape = [dim_size for dim_size in self._shape]
+            result_shape[-1] = result_shape[-1] * 2
+            fields_compatability = [
+                all(this_shape == other_shape for this_shape, other_shape in zip(result_shape, ecosystem_field.shape))
+                for ecosystem_field in ecosystem_fields
+            ]
+            return any(fields_compatability), [1.0 if field_compatable else 0.0 for field_compatable in fields_compatability]
+        else:
+            return False, [0.0 for field in ecosystem_fields]
+
+    def make_concat(self, dimension_with, dimension_to):
+        this_index = self._field_index
+        def concat_op(cell_op_states):
+            cell_op_states[dimension_to] = tf.concat([cell_op_states[this_index], cell_op_states[dimension_with]], axis=-1)
+        return concat_op
+
     def build_graphs(self, fields):
         self.build_field_shift_ops(fields)
         self.build_projection_ops(fields)
         self.build_einsum_ops(fields)
+        self.build_concat_ops(fields)
         self.build_elementwise_ops(fields)
+        self.build_conv_ops(fields)
+
+        can_field_shift = any((allowance == 1 for allowance in self._field_shift_allowances))
+        can_project = any(allowance == 1 for allowance in self._projection_allowances)
+        can_einsum = any(allowance == 1 for allowance in self._einsum_allowances)
+        can_concat = any(allowance == 1 for allowance in self._concat_allowances)
+        can_elementwise = any(allowance == 1 for allowance in self._elementwise_allowances)
+        can_conv = (3 == len(self.shape))
+
+        self._action_mask = [
+            1,
+            can_field_shift,
+            can_project,
+            1,
+            can_einsum,
+            can_conv,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            can_concat,
+            can_elementwise,
+            can_elementwise,
+        ]

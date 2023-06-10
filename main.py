@@ -1,5 +1,6 @@
 from Ecosystem import Ecosystem
 import tensorflow as tf
+import numpy as np
 
 
 def run_loop():
@@ -23,7 +24,14 @@ def run_loop():
         [4],
         [4]
     ])
+    eco.simulate(10000)
 
 
 if "__main__" == __name__:
+    test_array = tf.TensorArray(dtype=tf.float32, size=3)
+    test_array = test_array.write(0, .5)
+    test_array = test_array.write(1, .7)
+    test_stack_1 = test_array.stack()
+    test_array = test_array.write(2, 2.2)
+    test_stack_2 = test_array.stack()
     run_loop()
