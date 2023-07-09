@@ -1,82 +1,53 @@
 import tensorflow as tf
 import numpy as np
 import math
-from enum import IntEnum
 from typing import Tuple
 from Field import Field
+from CellEnums import ActionSet, ChromosomeSet
 
 
-class ChromosomeSet(IntEnum):
-    MAIN = 0
-    RESET = 1
-    FIELD_SHIFT = 2
-    PROJECTION = 3
-    EINSUM = 4
-    CONV = 5
-    MOVE = 6
-    MATE = 7
-    ADD_EPIGENE = 8
-    REMOVE_EPIGENE = 9
-    TRANSFER_ENERGY = 10
-    RECEIVE_ENERGY = 11
-    RECEPTORS = 12
-    CONCAT = 13
-    SELECT = 14
-    DIVIDE = 15
-    ADD = 16
-    EMIT = 17
+def breed_cells(mother_genome, father_genome, mutation_rate):
+    chromosomes = []
+    for mother_chromosome, father_chromosome in zip(mother_genome, father_genome):
+        chromosome = []
+        for mother_gene, father_gene in zip(mother_chromosome, father_chromosome):
+            mutation = tf.random.normal(tf.shape(mother_gene), mean=0.0, stddev=mutation_rate)
+            chromosome.append(
+                (mother_gene + father_gene) / 2 + mutation
+            )
+        chromosomes.append(chromosome)
 
-class ActionSet(IntEnum):
-    RESET = 0
-    FIELD_SHIFT = 1
-    PROJECTION = 2
-    SOFTMAX = 3
-    EINSUM = 4
-    CONV = 5
-    MOVE = 6
-    MATE = 7
-    ADD_EPIGENE = 8
-    REMOVE_EPIGENE = 9
-    LOCK = 10
-    UNLOCK = 11
-    TRANSFER_ENERGY = 12
-    WAIT = 13
-    CONCAT = 14
-    DIVIDE = 15
-    ADD = 16
 
+STARTING_MASK = tf.constant([1] + [0] * (len(ActionSet) - 1), dtype=tf.float32)
 
 class Cell:
-    def __init__(self, fields : Tuple[Field], mother_genome, father_genome, mutation_rate, epigenetics, w, x, y, z):
+    def __init__(self, fields : Tuple[Field], chromosomes, epigenetics, w, x, y, z):
+        pass
         self.fields = fields
         self._field_index = -1
         self.graph_ops = []
-        self.chromosomes = []
-        for mother_chromosome, father_chromosome in zip(mother_genome, father_genome):
-            chromosome = []
-            for mother_gene, father_gene in zip(mother_chromosome, father_chromosome):
-                mutation = tf.random.normal(tf.shape(mother_gene), mean=0.0, stddev=mutation_rate)
-                chromosome.append(
-                    (mother_gene + father_gene) / 2 + mutation
-                )
-            self.chromosomes.append(chromosome)
-        self.epigenetics = epigenetics
+        self.chromosomes = chromosomes
+        self._epigenetics = epigenetics
         self._energy = 100.0
-        self._action_mask = tf.constant([1] + [0] * 16, dtype=tf.float32)
+        self._action_mask = STARTING_MASK
+        self._gradient_acceptor = tf.Variable(1.0)
         self.w = w
         self.x = x
         self.y = y
         self.z = z
         self._last_reward = 0
-        self._gradient_acceptor = tf.Variable(1.0)
         self._transmit_reward = 0
         self._receive_reward = 0
+        self._visited_fields = set()
+        self._is_locked = False
+        self.graph_op_inputs = []
 
     def provide_chromosome(self, chromosome_index):
         return self.chromosomes[chromosome_index]
 
-    def provide_epigenes(self, gene_layer):
-        return self.epigenetics[gene_layer]
+    @property
+    def epigenetics(self):
+        return self._epigenetics
 
     @property
     def gradient_acceptor(self):
@@ -125,30 +96,60 @@ class Cell:
     def current_output_field(self):
         return self.fields[self._field_index]
 
+    @property
+    def visited_field(self):
+        return tuple(self._visited_fields)
+
+    @property
+    def is_locked(self):
+        return self._is_locked
+
+    def visited(self, field_index):
+        return field_index in self._visited_fields
+
+    @property
+    def has_graph(self):
+        return 0 < len(self.graph_ops)
+
     def accept_environment_epigene_manifext(self, manifest):
         self.epigene_manifest = manifest
 
     def add_field_shift(self, dimension_to):
+        self._visited_fields.add(self._field_index)
         self.graph_ops.append(self.current_output_field.dimensional_shift[dimension_to])
+        self.graph_op_inputs.append(("field_shift", self._field_index, dimension_to))
         self._field_index = dimension_to
         self._energy -= 1
 
     def add_projection(self, dimension_to, projection_key):
+        self._visited_fields.add(self._field_index)
         self.graph_ops.append(self.current_output_field.add_projection[dimension_to](projection_key))
+        self.graph_op_inputs.append(("projection", self._field_index, dimension_to, projection_key))
         self._field_index = dimension_to
         self._energy -= 3
 
     def add_softmax(self):
         self.graph_ops.append(self.current_output_field.softmax)
+        self.graph_op_inputs.append(("softmax", self._field_index))
+        self._energy -= 5
+
+    def add_bell(self):
+        self.graph_ops.append(self.current_output_field.bell)
+        self.graph_op_inputs.append(("bell", self._field_index))
         self._energy -= 5
 
     def add_einsum(self, dimension_with, dimension_to):
+        self._visited_fields.add(self._field_index)
         self.graph_ops.append(self.current_output_field.build_einsum_op(self.fields[int(dimension_with)], self.fields[int(dimension_to)]))
+        self.graph_op_inputs.append(("einsum", self._field_index, dimension_with, dimension_to))
+        self._visited_fields.add(dimension_with)
         self._field_index = dimension_to
         self._energy -= 20
 
     def add_conv(self, dimension_to, conv_gen_state):
+        self._visited_fields.add(self._field_index)
         self.graph_ops.append(self.current_output_field.make_conv[dimension_to](conv_gen_state))
+        self.graph_op_inputs.append(("conv", self._field_index, dimension_to, conv_gen_state))
         self._field_index = dimension_to
         self._energy -= 10
 
@@ -169,7 +170,7 @@ class Cell:
     def update_epigene(self, gene_layer, index, value):
         update_var = np.array(self.epigenetics[gene_layer])
         update_var[index] = value
-        self.epigenetics[gene_layer].assign(update_var)
+        self._epigenetics[gene_layer].assign(update_var)
 
     def add_epigene(self, gene_layer, index):
         self.update_epigene(gene_layer, index, 0.0)
@@ -183,12 +184,33 @@ class Cell:
         self._energy -= 1
 
     def lock(self):
-        self._action_mask = tf.constant([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0], dtype=tf.float32)
+        action_array = [0] * len(ActionSet)
+        action_array[ActionSet.MOVE] = 1
+        action_array[ActionSet.MATE] = 1
+        action_array[ActionSet.ADD_EPIGENE] = 1
+        action_array[ActionSet.REMOVE_EPIGENE] = 1
+        action_array[ActionSet.UNLOCK] = 1
+        action_array[ActionSet.TRANSFER_ENERGY] = 1
+        action_array[ActionSet.WAIT] = 1
+        self._action_mask = tf.constant(action_array, dtype=tf.float32)
+        self._is_locked = True
 
     def unlock(self):
-        mask = [1] * 17
-        mask[10] = 0
+        mask = [1] * len(ActionSet)
+        mask[ActionSet.UNLOCK] = 0
         self._action_mask = tf.constant(mask, dtype=tf.float32)
+        self._is_locked = False
+
+    def set_golden(self):
+        action_array = [0] * len(ActionSet)
+        action_array[ActionSet.MATE] = 1
+        action_array[ActionSet.ADD_EPIGENE] = 1
+        action_array[ActionSet.REMOVE_EPIGENE] = 1
+        action_array[ActionSet.TRANSFER_ENERGY] = 1
+        action_array[ActionSet.WAIT] = 1
+        self._action_mask = tf.constant(action_array, dtype=tf.float32)
+        self._is_locked = True
+
 
     def accept_energy(self, sender_key_and_hidden):
         hidden = tf.nn.relu(
@@ -208,29 +230,45 @@ class Cell:
     def reset(self, starting_field):
         self._field_index = starting_field
         self.graph_ops = []
+        self.graph_op_inputs = [("reset", starting_field)]
         self.unlock()
+        self._visited_fields = set()
+        self._visited_fields.add(starting_field)
         pass
 
     def add_concat(self, dimension_with, dimension_to):
+        self._visited_fields.add(self._field_index)
         concat_op = self.current_output_field.make_concat(dimension_with, dimension_to)
         self.graph_ops.append(concat_op)
+        self.graph_op_inputs.append(("concat", self._field_index, dimension_with, dimension_to))
         self._field_index = dimension_to
+        self._visited_fields.add(dimension_with)
         self._energy -= 5
 
-    def add_divide(self, dimension_with):
-        divide_op = self.current_output_field.make_divide[dimension_with]
-        self.graph_ops.append(divide_op)
+    def add_multiply(self, dimension_with):
+        multiply_op = self.current_output_field.make_multiply[dimension_with]
+        self.graph_ops.append(multiply_op)
+        self.graph_op_inputs.append(("multiply", self._field_index, dimension_with))
+        self._visited_fields.add(dimension_with)
         self._energy -= 10
 
     def add_add(self, dimension_with):
         add_op = self.current_output_field.make_add[dimension_with]
         self.graph_ops.append(add_op)
+        self.graph_op_inputs.append(("add", self._field_index, dimension_with))
+        self._visited_fields.add(dimension_with)
         self._energy -= 10
 
     def generate_ops(self):
-        @tf.function
-        def ops(cell_input_field_values):
-            cell_op_state = [tf.identity(field_value) for field_value in cell_input_field_values]
+        # @tf.function
+        def ops(cell_op_state):
+            instance_state = cell_op_state.copy()
             for op in self.graph_ops:
-                op(cell_op_state)
-            return cell_op_state[self._field_index]
+                op(instance_state)
+            clipped_result = tf.clip_by_value(
+                instance_state[self._field_index],
+                clip_value_min=-1e4,
+                clip_value_max=1e4
+            )
+            return clipped_result
+        return ops

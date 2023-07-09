@@ -1,5 +1,20 @@
 import numpy as np
 import tensorflow as tf
+from CellEnums import ActionSet
+import time
+
+# @tf.function
+# def gather_field_graph_values(emitted_values_array, field_edge_selection, gather_einsum_string, gather_weights):
+#     emitted_values = tf.gather(emitted_values_array, field_edge_selection)
+#     scaled_gradient_tracked_emitted_values = tf.einsum(gather_einsum_string,
+#                                                        gather_weights, emitted_values)
+#     scaled_value = tf.reduce_sum(scaled_gradient_tracked_emitted_values, axis=0)
+#     clipped_scale_value = tf.clip_by_value(scaled_value,
+#                                            clip_value_min=-1e4,
+#                                            clip_value_max=1e4
+#                                            )
+#     tf.debugging.check_numerics(clipped_scale_value, "Scaling evaluated to an invalid value")
+#     return clipped_scale_value
 
 class Field:
     def __init__(self, shape, field_index):
@@ -13,7 +28,7 @@ class Field:
         self._add_projection = None
         self._einsum = None
         self._make_conv = None
-        self._make_divide = None
+        self._make_multiply = None
         self._make_add = None
         self._concat_allowances = []
 
@@ -26,6 +41,53 @@ class Field:
         self._einsum_allowances_with = dict()
         self.einsum_string_dict = dict()
         self._concat_to_allowances = dict()
+
+        self.field_shift_times = 0
+        self.projection_times = 0
+        self.softmax_times = 0
+        self.einsum_times = 0
+        self.conv_times = 0
+        self.concat_times = 0
+        self.multiply_times = 0
+        self.add_times = 0
+        self.bell_times = 0
+
+        gather_node_field_einsum_part = "b" + "".join(chr(100 + j) for j in range(len(self.shape)))
+        gather_node_einsum_string = "a,a" + gather_node_field_einsum_part + "->" + \
+                                                           gather_node_field_einsum_part
+
+        # field_emitted_values_array_signature = [None, None] + [None for _ in shape]
+        field_emitted_values_array_signature = [None, None] + shape
+        self.test_signature = field_emitted_values_array_signature
+        gather_reshape = [-1] + shape
+        # @tf.function(input_signature=[
+        #     tf.TensorSpec(shape=field_emitted_values_array_signature, dtype=tf.float32),
+        #     tf.TensorSpec(shape=[None], dtype=tf.float32)
+        # ])
+        def gather_field_graph_values(emitted_values, gather_weights):
+            # emitted_values = tf.gather(field_emitted_values_array, field_edge_selection)
+            # scaled_value = tf.einsum(gather_node_einsum_string,
+            #                                                    gather_weights, emitted_values)
+            start_time = time.time()
+            flattened_emitted_values = tf.reshape(emitted_values, tf.pad(tf.shape(gather_weights), [[0, 1]], constant_values=-1))
+            gather_weights_broadcast = tf.tile(tf.reshape(gather_weights, [-1, 1]), tf.pad(tf.shape(flattened_emitted_values)[1:], [[1, 0]], constant_values=1))
+            weighted_emissions = tf.multiply(gather_weights_broadcast, flattened_emitted_values)
+            scaled_value = tf.reshape(
+                tf.reduce_sum(
+                    weighted_emissions,
+                    axis=0
+                ),
+                gather_reshape
+            )
+            # scaled_value = tf.reduce_sum(scaled_gradient_tracked_emitted_values, axis=0)
+            # clipped_scale_value = tf.clip_by_value(scaled_value,
+            #                                        clip_value_min=-1e4,
+            #                                        clip_value_max=1e4
+            #                                        )
+            # tf.debugging.check_numerics(clipped_scale_value, "Scaling evaluated to an invalid value")
+            return scaled_value
+
+        self.gather_field_graph_values = gather_field_graph_values
 
     @property
     def field_index(self):
@@ -78,18 +140,27 @@ class Field:
     def make_conv(self, value):
         self._make_conv = value
 
-
     @property
-    def make_divide(self):
-        return self._make_divide
+    def make_multiply(self):
+        return self._make_multiply
 
     @property
     def make_add(self):
         return self._make_add
 
-
     def softmax(self, cell_op_state):
-        cell_op_state[self._field_index] = tf.nn.softmax(cell_op_state[self._field_index], axis=-1)
+        start_time = time.time()
+        op_result = tf.nn.softmax(cell_op_state[self._field_index], axis=-1)
+        tf.debugging.check_numerics(op_result, "Softmax found NAN")
+        cell_op_state[self._field_index] = op_result
+        self.softmax_times += (time.time() - start_time)
+
+    def bell(self, cell_op_state):
+        start_time = time.time()
+        op_result = tf.math.exp(-1 * tf.square(cell_op_state[self._field_index]))
+        tf.debugging.check_numerics(op_result, "Softmax found NAN")
+        cell_op_state[self._field_index] = op_result
+        self.bell_times += (time.time() - start_time)
 
     @property
     def field_shift_allowances(self):
@@ -115,13 +186,22 @@ class Field:
     def build_field_shift_op(self, field):
         field_index = self._field_index
         other_index = field.field_index
+
         def field_shift_op(cell_op_state):
-            cell_op_state[other_index] = tf.reshape(cell_op_state[field_index], [-1] + field.shape)
+            start_time = time.time()
+            op_result = tf.reshape(cell_op_state[field_index], [-1] + field.shape)
+            tf.debugging.check_numerics(op_result, "Field Shift found NAN")
+            cell_op_state[other_index] = op_result
+            self.field_shift_times += (time.time() - start_time)
+
         return field_shift_op
 
     def build_projection_ops(self, fields):
         fields_compatible = tuple(
-            len(field.shape) == len(self._shape) and field.shape[-1] == self._shape[-1] and field.field_index != self._field_index for field in fields
+            len(field.shape) == len(self._shape) and
+            all(field_shape == self_shape for field_shape, self_shape in zip(field.shape[:-1], self.shape[:-1])) and
+            field.field_index != self._field_index
+            for field in fields
         )
         self._add_projection = tuple(
             self.build_projection_op(field) if fields_compatible[field.field_index] else None for field in fields
@@ -131,16 +211,28 @@ class Field:
     def build_projection_op(self, field):
         field_index = self._field_index
         other_index = field.field_index
-        w_1 = tf.random.normal([8, 32], seed=65)
-        b_1 = tf.random.normal([32], seed=65)
-        w_2 = tf.random.normal([32, field.shape[-1]], seed=65)
-        b_2 = tf.random.normal([field.shape[-1]], seed=65)
+        other_size = field.shape[-1]
+        w1 = tf.random.normal([16, 32], seed=65)
+        b1 = tf.random.normal([32], seed=65)
+        w2 = tf.random.normal([32, other_size, self._shape[-1]], seed=65)
+        b2 = tf.random.normal([other_size, self._shape[-1]], seed=65)
+
         def projection_op_generator(projection_key):
             projection_key_matrix = tf.reshape(projection_key, [1, -1])
-            indices = tf.matmul(tf.nn.relu(tf.matmul(projection_key_matrix, w_1) + b_1), w_2) + b_2
+            index_picker = tf.einsum("a,aos->os", tf.nn.relu(tf.matmul(projection_key_matrix, w1) + b1)[0], w2) + b2
+            indices = tf.argmax(index_picker, axis=1)
+            asymetric = other_size != self._shape[-1]
+            assert len(indices) == other_size
+
             def projection_op(cell_op_state):
-                cell_op_state[other_index] = tf.gather(cell_op_state[field_index], indices, axis=-1)
+                start_time = time.time()
+                op_result = tf.gather(cell_op_state[field_index], indices, axis=-1)
+                tf.debugging.check_numerics(op_result, "Projection found NAN")
+                # assert int(tf.shape(op_result)[-1]) == other_size
+                cell_op_state[other_index] = op_result
+                self.projection_times += (time.time() - start_time)
             return projection_op
+
         return projection_op_generator
 
     def build_conv_ops(self, fields):
@@ -158,15 +250,16 @@ class Field:
         kernel_gen_b_1 = tf.random.normal([32], seed=67)
         kernel_gen_w_2 = tf.random.normal([32, 5, 5, self._shape[-1], other_field.shape[-1]], seed=67)
         kernel_gen_b_2 = tf.random.normal([5, 5, self._shape[-1], other_field.shape[-1]], seed=67)
-        kernel_gen = lambda kernel_key: tf.einsum('di,iklft->dklft',tf.nn.relu(tf.matmul(kernel_key, kernel_gen_w_1) + kernel_gen_b_1),
-                  kernel_gen_w_2)[0,:] + kernel_gen_b_2
+        kernel_gen = lambda kernel_key: tf.einsum('di,iklft->dklft',
+                                                  tf.nn.relu(tf.matmul(kernel_key, kernel_gen_w_1) + kernel_gen_b_1),
+                                                  kernel_gen_w_2)[0, :] + kernel_gen_b_2
 
         bias_gen_w_1 = tf.random.normal([8, 32], seed=67)
         bias_gen_b_1 = tf.random.normal([32], seed=67)
         bias_gen_w_2 = tf.random.normal([32, other_field.shape[-1]], seed=67)
         bias_gen_b_2 = tf.random.normal([other_field.shape[-1]], seed=67)
         bias_gen = lambda kernel_key: tf.matmul(tf.nn.relu(tf.matmul(kernel_key, bias_gen_w_1) + bias_gen_b_1),
-                  bias_gen_w_2)[0,:] + bias_gen_b_2
+                                                bias_gen_w_2)[0, :] + bias_gen_b_2
 
         # return parameters as a tuple
         return kernel_gen, bias_gen, other_field.field_index
@@ -179,11 +272,21 @@ class Field:
             kernel_key, bias_key = tf.split(conv_key_matrix, 2, axis=1)
             kernel = kernel_gen(kernel_key)
             bias = bias_gen(bias_key)
+
             def conv_op(cell_op_state):
+                start_time = time.time()
                 conv_output = tf.nn.conv2d(cell_op_state[self._field_index], kernel, strides=[1, 1, 1, 1],
                                            padding='SAME')
                 conv_output = tf.nn.bias_add(conv_output, bias)
-                cell_op_state[other_index] = conv_output
+                clipped_result = tf.clip_by_value(
+                    conv_output,
+                    clip_value_min=-1e4,
+                    clip_value_max=1e4
+                )
+                tf.debugging.check_numerics(clipped_result, "Conv found NAN")
+                cell_op_state[other_index] = clipped_result
+                self.conv_times += (time.time() - start_time)
+            return conv_op
 
         return conv_op_generator
 
@@ -198,21 +301,21 @@ class Field:
         compatible_fields = [0.0] * len(ecosystem_fields)
         op_strings = [""] * len(ecosystem_fields)
         for i in range(dims_to):
-            self_fields_to_match = self._shape[-1*i:]
+            self_fields_to_match = self._shape[-1 * i:]
             other_fields_to_match = other.shape[:i]
             other_axes = "".join(chr(98 + j + self_dims - i) for j in range(other_dims))
-            einsum_string = f"a{self_axes},a{other_axes}->a{self_axes[:self_dims-i]}{other_axes[i:]}"
+            einsum_string = f"a{self_axes},a{other_axes}->a{self_axes[:self_dims - i]}{other_axes[i:]}"
 
             dim_match = True
             for j in zip(self_fields_to_match, other_fields_to_match):
                 dim_match = dim_match and j[0] == j[1]
 
             if dim_match:
-                output_shape = self._shape[:self_dims-i] + other.shape[i:]
+                output_shape = self._shape[:self_dims - i] + other.shape[i:]
                 for ecosystem_field_index, ecosystem_field in enumerate(ecosystem_fields):
                     if len(output_shape) == len(ecosystem_field.shape):
                         dim_matches = [output_dim_size == field_dim_size
-                                                 for output_dim_size, field_dim_size in zip(output_shape, ecosystem_field.shape)]
+                                       for output_dim_size, field_dim_size in zip(output_shape, ecosystem_field.shape)]
                         to_with_compatible = all(dim_matches)
 
                         if to_with_compatible:
@@ -228,8 +331,19 @@ class Field:
         to_index = other_to.field_index
         this_index = self._field_index
         einsum_string = self.einsum_string_dict[with_index][to_index]
+
         def einsum_op(cell_op_state):
-            cell_op_state[to_index] = tf.einsum(einsum_string, cell_op_state[this_index], cell_op_state[with_index])
+            start_time = time.time()
+            op_result = tf.einsum(einsum_string, cell_op_state[this_index], cell_op_state[with_index])
+            clipped_result = tf.clip_by_value(
+                op_result,
+                clip_value_min=-1e4,
+                clip_value_max=1e4
+            )
+            tf.debugging.check_numerics(clipped_result, "Einsum found NAN")
+            cell_op_state[to_index] = clipped_result
+            self.einsum_times += (time.time() - start_time)
+
         return einsum_op
 
     def build_einsum_ops(self, ecosystem_fields):
@@ -241,7 +355,8 @@ class Field:
                 self.einsum_string_dict[field_index] = field_einsum_compatability_props[2]
                 self.einsum_allowances_with[field_index] = field_einsum_compatability_props[1]
 
-        self._einsum_allowances = tuple(1.0 if compatible else 0.0 for compatible, _, _, _ in einsum_compatability_props)
+        self._einsum_allowances = tuple(
+            1.0 if compatible else 0.0 for compatible, _, _, _ in einsum_compatability_props)
 
     @property
     def projection_allowances(self):
@@ -271,24 +386,38 @@ class Field:
 
         self._elementwise_allowances = tuple(1.0 if compatible else 0 for compatible in elementwise_compatible)
         self._make_add = [self.build_add_op(other) if compatible else None
-                         for other, compatible in zip(fields, elementwise_compatible)]
-        self._make_divide = [self.build_divide_op(other) if compatible else None
-                         for other, compatible in zip(fields, elementwise_compatible)]
+                          for other, compatible in zip(fields, elementwise_compatible)]
+        self._make_multiply = [self.build_multiply_op(other) if compatible else None
+                               for other, compatible in zip(fields, elementwise_compatible)]
 
     def build_add_op(self, other):
         other_index = other.field_index
         this_index = self._field_index
+
         def add_op(cell_op_state):
-            cell_op_state[this_index] = cell_op_state[this_index] = cell_op_state[other_index]
+            start_time = time.time()
+            op_result = cell_op_state[this_index] + cell_op_state[other_index]
+            tf.debugging.check_numerics(op_result, "Add found NAN")
+            cell_op_state[this_index] = op_result
+            self.add_times += (time.time() - start_time)
         return add_op
 
-    def build_divide_op(self, other):
+    def build_multiply_op(self, other):
         other_index = other.field_index
         this_index = self._field_index
-        def divide_op(cell_op_state):
-            cell_op_state[this_index] = tf.divide(cell_op_state[this_index], cell_op_state[other_index])
 
-        return divide_op
+        def multiply_op(cell_op_state):
+            start_time = time.time()
+            op_result = tf.multiply(cell_op_state[this_index], cell_op_state[other_index])
+            clipped_result = tf.clip_by_value(
+                op_result,
+                clip_value_min=-1e4,
+                clip_value_max=1e4
+            )
+            tf.debugging.check_numerics(clipped_result, "Multiply found NAN")
+            cell_op_state[this_index] = clipped_result
+            self.multiply_times += (time.time() - start_time)
+        return multiply_op
 
     def build_concat_ops(self, fields):
         compatabilities = [self.check_concat_compatibility(field, fields) for field in fields]
@@ -298,23 +427,34 @@ class Field:
             if compatability[0]:
                 self._concat_to_allowances[field_index] = compatability[1]
 
-
     def check_concat_compatibility(self, other_field, ecosystem_fields):
-        if len(self._shape) == len(other_field.shape) and all(this_shape == other_shape for this_shape, other_shape in zip(self._shape, other_field.shape)):
+        if len(self._shape) == len(other_field.shape) and all(
+                this_shape == other_shape for this_shape, other_shape in zip(self._shape, other_field.shape)):
             result_shape = [dim_size for dim_size in self._shape]
             result_shape[-1] = result_shape[-1] * 2
             fields_compatability = [
-                all(this_shape == other_shape for this_shape, other_shape in zip(result_shape, ecosystem_field.shape))
+                (
+                        len(result_shape) == len(ecosystem_field.shape) and
+                        all(this_shape == other_shape for this_shape, other_shape in
+                            zip(result_shape, ecosystem_field.shape))
+                )
                 for ecosystem_field in ecosystem_fields
             ]
-            return any(fields_compatability), [1.0 if field_compatable else 0.0 for field_compatable in fields_compatability]
+            return any(fields_compatability), [1.0 if field_compatable else 0.0 for field_compatable in
+                                               fields_compatability]
         else:
             return False, [0.0 for field in ecosystem_fields]
 
     def make_concat(self, dimension_with, dimension_to):
         this_index = self._field_index
+
         def concat_op(cell_op_states):
-            cell_op_states[dimension_to] = tf.concat([cell_op_states[this_index], cell_op_states[dimension_with]], axis=-1)
+            start_time = time.time()
+            op_result = tf.concat([cell_op_states[this_index], cell_op_states[dimension_with]], axis=-1)
+            tf.debugging.check_numerics(op_result, "Concat found NAN")
+            cell_op_states[dimension_to] = op_result
+            self.concat_times += (time.time() - start_time)
+
         return concat_op
 
     def build_graphs(self, fields):
@@ -332,22 +472,22 @@ class Field:
         can_elementwise = any(allowance == 1 for allowance in self._elementwise_allowances)
         can_conv = (3 == len(self.shape))
 
-        self._action_mask = [
-            1,
-            can_field_shift,
-            can_project,
-            1,
-            can_einsum,
-            can_conv,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            can_concat,
-            can_elementwise,
-            can_elementwise,
-        ]
+        self._action_mask = [1 for _ in ActionSet]
+        self._action_mask[ActionSet.FIELD_SHIFT] = can_field_shift
+        self._action_mask[ActionSet.PROJECTION] = can_project
+        self._action_mask[ActionSet.EINSUM] = can_einsum
+        self._action_mask[ActionSet.CONV] = can_conv
+        self._action_mask[ActionSet.CONCAT] = can_concat
+        self._action_mask[ActionSet.ADD] = can_elementwise
+        self._action_mask[ActionSet.MULTIPLY] = can_elementwise
+
+    def reset_op_times(self):
+        self.field_shift_times = 0
+        self.projection_times = 0
+        self.softmax_times = 0
+        self.einsum_times = 0
+        self.conv_times = 0
+        self.concat_times = 0
+        self.multiply_times = 0
+        self.add_times = 0
+        self.bell_times = 0

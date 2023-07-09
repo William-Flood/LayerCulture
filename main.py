@@ -6,7 +6,6 @@ import numpy as np
 def run_loop():
     eco = Ecosystem([
         [16,16,64],
-        [4096],
         [16,16,8],
         [16,16,4],
         [16,16,4],
@@ -22,8 +21,11 @@ def run_loop():
         [128],
         [64],
         [4],
-        [4]
-    ])
+        [4],
+        [4096]
+    ]
+    ,initial_cell_groups=200
+    )
     eco.simulate(10000)
 
 
