@@ -148,19 +148,19 @@ class Field:
     def make_add(self):
         return self._make_add
 
-    def softmax(self, cell_op_state):
+    def softmax(self, input_val):
         start_time = time.time()
-        op_result = tf.nn.softmax(cell_op_state[self._field_index], axis=-1)
+        op_result = tf.nn.softmax(input_val, axis=-1)
         tf.debugging.check_numerics(op_result, "Softmax found NAN")
-        cell_op_state[self._field_index] = op_result
         self.softmax_times += (time.time() - start_time)
+        return op_result
 
-    def bell(self, cell_op_state):
+    def bell(self, input_val):
         start_time = time.time()
-        op_result = tf.math.exp(-1 * tf.square(cell_op_state[self._field_index]))
+        op_result = 1.0 / (1.0 + tf.square(input_val))
         tf.debugging.check_numerics(op_result, "Softmax found NAN")
-        cell_op_state[self._field_index] = op_result
         self.bell_times += (time.time() - start_time)
+        return op_result
 
     @property
     def field_shift_allowances(self):
@@ -187,12 +187,12 @@ class Field:
         field_index = self._field_index
         other_index = field.field_index
 
-        def field_shift_op(cell_op_state):
+        def field_shift_op(input_val):
             start_time = time.time()
-            op_result = tf.reshape(cell_op_state[field_index], [-1] + field.shape)
+            op_result = tf.reshape(input_val, [-1] + field.shape)
             tf.debugging.check_numerics(op_result, "Field Shift found NAN")
-            cell_op_state[other_index] = op_result
             self.field_shift_times += (time.time() - start_time)
+            return op_result
 
         return field_shift_op
 
@@ -224,13 +224,13 @@ class Field:
             asymetric = other_size != self._shape[-1]
             assert len(indices) == other_size
 
-            def projection_op(cell_op_state):
+            def projection_op(input_val):
                 start_time = time.time()
-                op_result = tf.gather(cell_op_state[field_index], indices, axis=-1)
+                op_result = tf.gather(input_val, indices, axis=-1)
                 tf.debugging.check_numerics(op_result, "Projection found NAN")
                 # assert int(tf.shape(op_result)[-1]) == other_size
-                cell_op_state[other_index] = op_result
                 self.projection_times += (time.time() - start_time)
+                return op_result
             return projection_op
 
         return projection_op_generator
@@ -273,9 +273,9 @@ class Field:
             kernel = kernel_gen(kernel_key)
             bias = bias_gen(bias_key)
 
-            def conv_op(cell_op_state):
+            def conv_op(input_val):
                 start_time = time.time()
-                conv_output = tf.nn.conv2d(cell_op_state[self._field_index], kernel, strides=[1, 1, 1, 1],
+                conv_output = tf.nn.conv2d(input_val, kernel, strides=[1, 1, 1, 1],
                                            padding='SAME')
                 conv_output = tf.nn.bias_add(conv_output, bias)
                 clipped_result = tf.clip_by_value(
@@ -284,8 +284,8 @@ class Field:
                     clip_value_max=1e4
                 )
                 tf.debugging.check_numerics(clipped_result, "Conv found NAN")
-                cell_op_state[other_index] = clipped_result
                 self.conv_times += (time.time() - start_time)
+                return conv_output
             return conv_op
 
         return conv_op_generator
@@ -332,17 +332,17 @@ class Field:
         this_index = self._field_index
         einsum_string = self.einsum_string_dict[with_index][to_index]
 
-        def einsum_op(cell_op_state):
+        def einsum_op(left_input_val, right_input_val):
             start_time = time.time()
-            op_result = tf.einsum(einsum_string, cell_op_state[this_index], cell_op_state[with_index])
+            op_result = tf.einsum(einsum_string, left_input_val, right_input_val)
             clipped_result = tf.clip_by_value(
                 op_result,
                 clip_value_min=-1e4,
                 clip_value_max=1e4
             )
             tf.debugging.check_numerics(clipped_result, "Einsum found NAN")
-            cell_op_state[to_index] = clipped_result
             self.einsum_times += (time.time() - start_time)
+            return op_result
 
         return einsum_op
 
@@ -391,32 +391,30 @@ class Field:
                                for other, compatible in zip(fields, elementwise_compatible)]
 
     def build_add_op(self, other):
-        other_index = other.field_index
-        this_index = self._field_index
 
-        def add_op(cell_op_state):
+        def add_op(left_input_val, right_input_val):
             start_time = time.time()
-            op_result = cell_op_state[this_index] + cell_op_state[other_index]
+            op_result = left_input_val + right_input_val
             tf.debugging.check_numerics(op_result, "Add found NAN")
-            cell_op_state[this_index] = op_result
             self.add_times += (time.time() - start_time)
+            return op_result
         return add_op
 
     def build_multiply_op(self, other):
         other_index = other.field_index
         this_index = self._field_index
 
-        def multiply_op(cell_op_state):
+        def multiply_op(left_input_val, right_input_val):
             start_time = time.time()
-            op_result = tf.multiply(cell_op_state[this_index], cell_op_state[other_index])
+            op_result = tf.multiply(left_input_val, right_input_val)
             clipped_result = tf.clip_by_value(
                 op_result,
                 clip_value_min=-1e4,
                 clip_value_max=1e4
             )
             tf.debugging.check_numerics(clipped_result, "Multiply found NAN")
-            cell_op_state[this_index] = clipped_result
             self.multiply_times += (time.time() - start_time)
+            return op_result
         return multiply_op
 
     def build_concat_ops(self, fields):
@@ -448,12 +446,12 @@ class Field:
     def make_concat(self, dimension_with, dimension_to):
         this_index = self._field_index
 
-        def concat_op(cell_op_states):
+        def concat_op(left_input_val, right_input_val):
             start_time = time.time()
-            op_result = tf.concat([cell_op_states[this_index], cell_op_states[dimension_with]], axis=-1)
+            op_result = tf.concat([left_input_val, right_input_val], axis=-1)
             tf.debugging.check_numerics(op_result, "Concat found NAN")
-            cell_op_states[dimension_to] = op_result
             self.concat_times += (time.time() - start_time)
+            return op_result
 
         return concat_op
 

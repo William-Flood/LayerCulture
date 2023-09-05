@@ -172,8 +172,31 @@ def perform_conv(hidden_state_action_list, cells, field_count):
             # The cell's field_index property will be updated to the value of field_selection
             cell.add_conv(int(field_selection), cell_kernel_generation_seed)
 
+@tf.function
+def update_scalings(changed_positions, all_positions, old_distance_scalings, scaling_gather_indices):
+    changed_positions_ex = tf.expand_dims(changed_positions, axis=0)
+    new_positions_ex = tf.expand_dims(all_positions, axis=1)
+    squared_diffs = tf.square(changed_positions_ex - new_positions_ex)
+    distances = tf.sqrt(tf.reduce_sum(squared_diffs, axis=-1))
+    distance_scalings_updates = 1 / tf.square(1 + distances)
+    distance_scalings_concat_1 = tf.concat([old_distance_scalings, distance_scalings_updates], axis=1)
+    distance_scalings_update_1 = tf.gather(distance_scalings_concat_1, scaling_gather_indices, axis=1)
+    distance_scalings_concat_2 = tf.concat([tf.transpose(distance_scalings_update_1, [1, 0]), distance_scalings_updates], axis=1)
+    unmasked_updated_scalings = tf.gather(distance_scalings_concat_2, scaling_gather_indices, axis=1)
+    updated_scalings = tf.multiply(unmasked_updated_scalings, 1.0 - tf.eye(tf.shape(all_positions)[0]))
+    return updated_scalings
 
-def perform_move(hidden_state_action_list, cells, origial_positions, move_gather_arg):
+
+
+@tf.function
+def update_positions_and_scalings(state_1, origial_positions, move_gather_arg, updating_indexes, old_distance_scalings, scaling_gather_indices):
+    static_and_deltas = tf.concat([tf.zeros([1, 4]), state_1], axis=0)
+    new_positions = origial_positions + tf.gather(static_and_deltas, move_gather_arg, axis=0)
+    new_distance_scalings = update_scalings(tf.gather(new_positions, updating_indexes), new_positions, old_distance_scalings, scaling_gather_indices)
+    return new_positions, new_distance_scalings
+
+
+def perform_move(hidden_state_action_list, cells, origial_positions, move_gather_arg, updating_indexes, distance_scalings, scaling_gather_indices):
     if 0 < len(hidden_state_action_list):
         action_states = tf.stack(hidden_state_action_list, axis=0)
         w1, b1 = batch_genes(cells, ChromosomeSet.DIRECTION_SELECTOR, 2)
@@ -182,11 +205,17 @@ def perform_move(hidden_state_action_list, cells, origial_positions, move_gather
         for cell, direction in zip(cells, state_1):
             cell.move(direction[0], direction[1], direction[2], direction[3])
 
-        static_and_deltas = tf.concat([tf.zeros([1, 4]), state_1], axis=0)
-        new_positions = origial_positions + tf.gather(static_and_deltas, move_gather_arg, axis=0)
-        return new_positions
+        new_positions, new_distance_scalings = update_positions_and_scalings(state_1, origial_positions, move_gather_arg, updating_indexes, distance_scalings, scaling_gather_indices)
+        return new_positions, new_distance_scalings
     else:
-        return origial_positions
+        if distance_scalings is None:
+            changed_positions_ex = tf.expand_dims(origial_positions, axis=0)
+            new_positions_ex = tf.expand_dims(origial_positions, axis=1)
+            squared_diffs = tf.square(changed_positions_ex - new_positions_ex)
+            distances = tf.sqrt(tf.reduce_sum(squared_diffs, axis=-1))
+            distance_scalings_unmasked = 1 / tf.square(1 + distances)
+            distance_scalings = tf.multiply(distance_scalings_unmasked, 1.0 - tf.eye(tf.shape(origial_positions)[0]))
+        return origial_positions, distance_scalings
 
 
 def perform_mate(hidden_state_list, cells, mating_list):
@@ -196,7 +225,7 @@ def perform_mate(hidden_state_list, cells, mating_list):
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
         for cell, direction in zip(cells, state_1):
             if cell.mate():
-                mating_list.append((cell, direction))
+                mating_list.append((cell, direction + tf.constant(np.array([cell.w, cell.x, cell.y, cell.z], dtype=np.float32))))
 
 
 def perform_add_epigene(hidden_state_list, cells):
@@ -229,7 +258,7 @@ def perform_transfer_energy(hidden_state_list, cells, transfer_list):
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
         cells_direction, cells_key = tf.split(state_1, [4, 16], axis=1)
         for cell, direction, key in zip(cells, cells_direction, cells_key):
-            transfer_list.append((cell, direction, key))
+            transfer_list.append((cell, direction + tf.constant(np.array([cell.w, cell.x, cell.y, cell.z], dtype=np.float32)), key))
 
 
 def perform_concat(hidden_state_list, cells):
@@ -326,31 +355,26 @@ def perform_add(hidden_state_list, cells, fields):
             cell.add_add(int(field_selection))
 
 @tf.function
-def calculate_masked_distances(cell_positions, cell_count):
-    a_position_tensor = tf.tile(tf.reshape(cell_positions, [cell_count, 1, 4]), [1, cell_count, 1])
-    b_position_tensor = tf.tile(tf.reshape(cell_positions, [1, cell_count, 4 ]), [cell_count, 1, 1])
-    cell_identity = tf.eye(cell_count, dtype=tf.float32)
-    displacements = a_position_tensor - b_position_tensor
-    distances = tf.math.sqrt(tf.reduce_sum(tf.square(displacements), axis=2))
+def calculate_masked_distances(distance_scaling, cell_count, cell_positions):
     cell_ones = tf.ones([cell_count, cell_count], dtype=tf.float32)
-    distance_scaling = tf.divide(cell_ones, distances + cell_ones)
-    masked_distances = tf.multiply(distance_scaling, cell_ones - cell_identity)
-    front_mask = (displacements[:, :, 0] + 1.0) / 2.0
+    zs_extended = tf.expand_dims(cell_positions[:,3], axis=1)
+    zs_extended_transpose = tf.transpose(zs_extended,[1, 0])
+    front_mask = tf.sign(zs_extended - zs_extended_transpose)
     back_mask = cell_ones - front_mask
     front_back_masked_distances = tf.stack(
         (
-            tf.multiply(masked_distances, front_mask),
-            tf.multiply(masked_distances, back_mask)
+            tf.multiply(distance_scaling, front_mask),
+            tf.multiply(distance_scaling, back_mask)
         ),
         axis=1
     )
     return front_back_masked_distances
 
-def perform_signal(cells, hidden_states, cell_positions):
+def perform_signal(cells, hidden_states, cell_positions, distance_scalings):
     if 0 < len(hidden_states):
         # distance_calc_start = time.time()
         cell_count = len(cells)
-        front_back_masked_distances = calculate_masked_distances(cell_positions, tf.constant(cell_count))
+        front_back_masked_distances = calculate_masked_distances(distance_scalings, tf.constant(cell_count), cell_positions)
         # batch_start = time.time()
         # distance_calc_duration = batch_start - distance_calc_start
         w1, b1, w2, b2 = \
@@ -365,7 +389,7 @@ def perform_signal(cells, hidden_states, cell_positions):
         # signal_duration = time.time() - signal_calc_start
         return cell_signal_inputs
 
-def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values, mating_list, transfer_list, cell_positions):
+def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values, mating_list, transfer_list, cell_positions, cell_distance_scalings):
     cell_action_filters = tf.TensorArray(dtype=tf.float32, size=len(cells))
     # cell_energy = tf.TensorArray(dtype=tf.float32, size=len(cells))
     # cell_reward = tf.TensorArray(dtype=tf.float32, size=len(cells))
@@ -442,13 +466,18 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     )
     # wait
     move_gather_arg = np.zeros([len(cells)], dtype=np.int32)
-    move_counter = 1
+    move_counter = 0
     # times.append(time.time())
+
+    move_scaling_gather_indices = [index for index in range(len(cells))]
+    move_updating_indexes = []
     for cell, selection, index in zip(cells, cell_selections, range(len(cells))):
         data_set[selection].append((cell, index))
         if(selection == int(ActionSet.MOVE)):
-            move_gather_arg[index] = move_counter
+            move_gather_arg[index] = move_counter + 1
+            move_scaling_gather_indices[index] = len(cells) + move_counter
             move_counter += 1
+            move_updating_indexes.append(index)
     # times.append(time.time())
     perform_reset(
         tf.gather(action_states, np.array(tuple(data[1] for data in reset_data), dtype=np.int32)),
@@ -499,11 +528,14 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     # times.append(time.time())
     # actions.append("conv")
     # action_cell_counts.append(len(conv_data))
-    new_positions = perform_move(
+    new_positions, new_distance_scalings = perform_move(
         tf.gather(action_states, np.array(tuple(data[1] for data in move_data), dtype=np.int32)),
         tuple(data[0] for data in move_data),
         cell_positions,
-        move_gather_arg
+        move_gather_arg,
+        move_updating_indexes,
+        cell_distance_scalings,
+        move_scaling_gather_indices
     )
     # times.append(time.time())
     # actions.append("move")
@@ -568,12 +600,12 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     # times.append(time.time())
     # actions.append("add")
     # action_cell_counts.append(len(add_data))
-    output_signal = perform_signal(cells, new_hidden, new_positions)
+    output_signal = perform_signal(cells, new_hidden, new_positions, new_distance_scalings)
     # times.append(time.time())
     # actions.append("signal")
     # action_cell_counts.append(len(cells))
     # time_segments = [f"{action}: {time_a - time_b}; avg: {(time_a - time_b) / float(count)}" for time_a, time_b, action, count in zip(times[1:], times[:-1], actions, action_cell_counts) if count > 0]
     # total = times[-1] - times[0]
-    return new_hidden, new_positions, output_signal
+    return new_hidden, new_positions, output_signal, new_distance_scalings
 
 

@@ -1,3 +1,5 @@
+import os
+
 from Ecosystem import Ecosystem
 import tensorflow as tf
 import numpy as np
@@ -26,10 +28,18 @@ def run_loop():
     ]
     ,initial_cell_groups=200
     )
-    eco.simulate(10000)
+    eco.simulate(
+        10000,
+        r"/media/abyssal-dragon/New Volume/ArtAssistData/Records/OriginalIntermediateLayers.tfrecord",
+        "/media/abyssal-dragon/New Volume/ArtAssistData/Records/generate_graph.txt",
+        graph_training_cycles=3,
+        sample_graph_copy_amount=2)
+    # eco.test_scaling()
 
 
 if "__main__" == __name__:
+    # Ensures the records drive is mounted.
+    _ = os.listdir("/media/abyssal-dragon/New Volume/ArtAssistData/Records/")
     test_array = tf.TensorArray(dtype=tf.float32, size=3)
     test_array = test_array.write(0, .5)
     test_array = test_array.write(1, .7)
