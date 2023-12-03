@@ -1,20 +1,8 @@
 import numpy as np
 import tensorflow as tf
-from CellEnums import ActionSet
+from CellConstants import ActionSet
 import time
 
-# @tf.function
-# def gather_field_graph_values(emitted_values_array, field_edge_selection, gather_einsum_string, gather_weights):
-#     emitted_values = tf.gather(emitted_values_array, field_edge_selection)
-#     scaled_gradient_tracked_emitted_values = tf.einsum(gather_einsum_string,
-#                                                        gather_weights, emitted_values)
-#     scaled_value = tf.reduce_sum(scaled_gradient_tracked_emitted_values, axis=0)
-#     clipped_scale_value = tf.clip_by_value(scaled_value,
-#                                            clip_value_min=-1e4,
-#                                            clip_value_max=1e4
-#                                            )
-#     tf.debugging.check_numerics(clipped_scale_value, "Scaling evaluated to an invalid value")
-#     return clipped_scale_value
 
 class Field:
     def __init__(self, shape, field_index):
@@ -56,22 +44,18 @@ class Field:
         gather_node_einsum_string = "a,a" + gather_node_field_einsum_part + "->" + \
                                                            gather_node_field_einsum_part
 
-        # field_emitted_values_array_signature = [None, None] + [None for _ in shape]
         field_emitted_values_array_signature = [None, None] + shape
         self.test_signature = field_emitted_values_array_signature
+        emit_prebatch_size = int(np.prod(shape))
         gather_reshape = [-1] + shape
         # @tf.function(input_signature=[
         #     tf.TensorSpec(shape=field_emitted_values_array_signature, dtype=tf.float32),
         #     tf.TensorSpec(shape=[None], dtype=tf.float32)
         # ])
-        def gather_field_graph_values(emitted_values, gather_weights):
-            # emitted_values = tf.gather(field_emitted_values_array, field_edge_selection)
-            # scaled_value = tf.einsum(gather_node_einsum_string,
-            #                                                    gather_weights, emitted_values)
-            start_time = time.time()
-            flattened_emitted_values = tf.reshape(emitted_values, tf.pad(tf.shape(gather_weights), [[0, 1]], constant_values=-1))
-            gather_weights_broadcast = tf.tile(tf.reshape(gather_weights, [-1, 1]), tf.pad(tf.shape(flattened_emitted_values)[1:], [[1, 0]], constant_values=1))
-            weighted_emissions = tf.multiply(gather_weights_broadcast, flattened_emitted_values)
+        def gather_field_graph_values(emitted_values, distance_weights, training_var):
+            emit_size = emit_prebatch_size * tf.shape(emitted_values)[1]
+            flattened_emitted_values = tf.reshape(emitted_values, [-1, emit_size])
+            weighted_emissions = tf.multiply(tf.multiply(distance_weights, training_var), flattened_emitted_values)
             scaled_value = tf.reshape(
                 tf.reduce_sum(
                     weighted_emissions,
@@ -79,12 +63,6 @@ class Field:
                 ),
                 gather_reshape
             )
-            # scaled_value = tf.reduce_sum(scaled_gradient_tracked_emitted_values, axis=0)
-            # clipped_scale_value = tf.clip_by_value(scaled_value,
-            #                                        clip_value_min=-1e4,
-            #                                        clip_value_max=1e4
-            #                                        )
-            # tf.debugging.check_numerics(clipped_scale_value, "Scaling evaluated to an invalid value")
             return scaled_value
 
         self.gather_field_graph_values = gather_field_graph_values

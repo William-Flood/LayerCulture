@@ -15,5 +15,5 @@ def provide_dataset(dataset_file_name, batch_size):
     #   example_dataset.map(map_example).repeat().shuffle(1000).batch(options["batch_size"])
     # ))
 
-    dataset_iter = iter(example_dataset.repeat().shuffle(1000).map(map_example).batch(batch_size))
+    dataset_iter = iter(example_dataset.repeat().shuffle(2000).map(map_example).batch(batch_size))
     return dataset_iter

@@ -3,12 +3,13 @@ import tensorflow as tf
 from Field import Field
 from GenerateRandomChromosomes import create_random_genome
 from Cell import Cell, breed_cells
-import random
 from CellBatchOperator import CELL_CENTRAL_LAYER_SIZE, CELL_CENTRAL_LAYER_COUNT, operate, update_scalings
-from Node import Node
 import time
-import DatasetProvider
-from Graph import Graph
+import multiprocessing as mp
+from threading import Thread
+from queue import Queue
+from train import train
+
 
 
 def make_ecosystem(fields_shapes):
@@ -62,8 +63,6 @@ class Ecosystem:
         self.target_graph_size = 512
         last_time = time.time()
         self.total_mutation_size = None
-        total_chomosome_sizes = None
-        genome_gene_shapes = None
         self.create_mutations = lambda g: None
         self.total_graph_node_count = total_graph_node_count
         self.mutation_rate = mutation_rate
@@ -80,6 +79,23 @@ class Ecosystem:
         last_time = time.time()
 
     def add_random_cells(self):
+        """
+            Adds random cells to the ecosystem.
+
+            This method generates new cells with random genomes and positions them within the ecosystem's fields.
+            The number of cells added is determined by the generated_family_size attribute of the Ecosystem.
+            Each cell's genome undergoes mutation according to the mutation rate defined in the Ecosystem.
+
+            Returns:
+                new_cells (list[Cell]): A list of newly created cells added to the ecosystem.
+                cell_positions (list[tf.Tensor]): A list of 4D tensor positions corresponding to each new cell in new_cells.
+
+            Note:
+                - If the total_mutation_size attribute is not set, this method initializes it along with
+                  other relevant attributes like create_mutations.
+                - The initial position of the family of new cells is determined by a random uniform distribution.
+                  Subsequent positions within the family are slightly offset using a normal distribution.
+        """
         new_cells = []
         cell_positions = []
         genome = create_random_genome(len(self._fields), hidden_size=CELL_CENTRAL_LAYER_SIZE)
@@ -113,19 +129,25 @@ class Ecosystem:
         return new_cells, cell_positions
 
 
-    def simulate(self, simulation_steps, training_set_file_name, output_file, sample_graph_copy_amount=10, graph_training_cycles=20,
-                 total_candidate_used_node_count=500, energy_reward=1000, copy_scale_start=1.1, copy_scale_end=0.8):
+    def simulate(self, simulation_steps, training_set_file_name, output_file, graph_training_cycles=20,
+                 energy_reward=1000):
+
+        mp.set_start_method("forkserver")
         hidden_states = tf.zeros([len(self.cells), CELL_CENTRAL_LAYER_SIZE])
         cell_signals = tf.zeros([len(self.cells), 2, 8])
         cell_positions_tensor = tf.stack(self.cell_positions)
         last_time = time.time()
-        SPLITS_FOR_SEGMENTS = 10
-        training_set_iter = DatasetProvider.provide_dataset(training_set_file_name, batch_size=256)
-        # trainer = tf.keras.optimizers.RMSprop(learning_rate=0.0001)
-        candidate_graphs = []
-        trainer = tf.keras.optimizers.RMSprop()
-        distance_scalings = None
-        sample_graphs = []
+
+        changed_positions_ex = tf.expand_dims(self.cell_positions, axis=0)
+        new_positions_ex = tf.expand_dims(self.cell_positions, axis=1)
+        squared_diffs = tf.square(changed_positions_ex - new_positions_ex)
+        distances = tf.sqrt(tf.reduce_sum(squared_diffs, axis=-1))
+        distance_scalings_unmasked = 1 / tf.square(1 + distances)
+        distance_scalings = tf.multiply(distance_scalings_unmasked, 1.0 - tf.eye(tf.shape(self.cell_positions)[0]))
+        losses = []
+        times = []
+        lowest_loss = None
+        last_golden = [False for _ in self.cells]
 
 
         for step_index in range(simulation_steps):
@@ -138,28 +160,18 @@ class Ecosystem:
             hidden_states, cell_positions_tensor, cell_signals, distance_scalings = operate(self.cells, self._fields, hidden_states,
                                                                          cell_signals, mating_list, transfer_list,
                                                                          cell_positions_tensor, distance_scalings)
-
-
-            cells_with_graphs = [cell for cell in self.cells if cell.has_graph]
-            if 50 < len(cells_with_graphs):
-                if 0 == len(candidate_graphs):
-                    starting_graph = Graph(self.cells, self._fields, 5, 2000, distance_scalings)
-                    candidate_graphs.append(starting_graph)
-                    _ = starting_graph.train(training_set_iter, trainer, graph_training_cycles)
-                sample_graphs = []
-                for graph in candidate_graphs:
-                    sample_graphs.extend(graph.copy(sample_graph_copy_amount, copy_scale_start, copy_scale_end, distance_scalings))
-                for graph in sample_graphs:
-                    graph.train(training_set_iter, trainer, graph_training_cycles)
-                sample_graphs.sort(key=lambda sample_graph: sample_graph.evaluation_score)
-                candidate_graphs = []
-                for scored_graph in sample_graphs:
-                    candidate_graphs.append(scored_graph)
-                    if sum([len(graph.hot_sources) for graph in candidate_graphs]) > total_candidate_used_node_count:
-                        break
-                candidate_graph_energy = energy_reward * (1 - tf.nn.softmax([graph.evaluation_score for graph in candidate_graphs]))
-                for rewarded_graph, energy in zip(candidate_graphs, candidate_graph_energy):
-                    rewarded_graph.allocate_energy(energy, distance_scalings)
+            step_times, step_losses, golden_graph, step_rewards = self.launch_training(graph_training_cycles,
+                distance_scalings, energy_reward, training_set_file_name, last_golden)
+            times.append(step_times)
+            losses.append(step_losses)
+            end_loss_performance = np.average(losses[-1][-5:])
+            new_record = lowest_loss is None or end_loss_performance < lowest_loss
+            if new_record:
+                lowest_loss = end_loss_performance
+                last_golden = golden_graph
+            for cell, reward, is_golden in zip(self.cells, step_rewards, last_golden):
+                cell.reward(reward)
+                cell.golden_lock = is_golden
             self.manage_energy_transfer(transfer_list, cell_positions_tensor, hidden_states)
             cell_positions_tensor, new_indices = self.mate_cells(mating_list, cell_positions_tensor)
             dead_cell_indexes = [cell_index for cell_index, cell in enumerate(self.cells) if cell.is_dead]
@@ -168,13 +180,15 @@ class Ecosystem:
                 while self.generated_family_size < len(dead_cell_indexes):
                     new_cells, new_cell_positions = self.add_random_cells()
                     for new_cell, new_cell_position in zip(new_cells, new_cell_positions):
-                        refreshing_index = dead_cell_indexes.pop()
-                        self.cells[refreshing_index] = new_cell
-                        updating_position_tensor[refreshing_index][0] = new_cell_position[0]
-                        updating_position_tensor[refreshing_index][1] = new_cell_position[1]
-                        updating_position_tensor[refreshing_index][2] = new_cell_position[2]
-                        updating_position_tensor[refreshing_index][3] = new_cell_position[3]
-                        new_indices.append(refreshing_index)
+                        replacement_index = dead_cell_indexes.pop()
+                        if self.cells[replacement_index].golden_lock:
+                            raise Exception("Replacing golden cell")
+                        self.cells[replacement_index] = new_cell
+                        updating_position_tensor[replacement_index][0] = new_cell_position[0]
+                        updating_position_tensor[replacement_index][1] = new_cell_position[1]
+                        updating_position_tensor[replacement_index][2] = new_cell_position[2]
+                        updating_position_tensor[replacement_index][3] = new_cell_position[3]
+                        new_indices.append(replacement_index)
                 cell_positions_tensor = tf.constant(updating_position_tensor)
             scaling_gather_indices = [index for index in range(len(self.cells))]
             updating_index = len(self.cells)
@@ -187,12 +201,41 @@ class Ecosystem:
                     cell_positions_tensor,
                     distance_scalings,
                     scaling_gather_indices)
-            for updating_graph in candidate_graphs:
-                updating_graph.refresh_sources(new_indices, self.cells)
-        with open(output_file) as graph_output:
-            graph_output.write(sample_graphs[0].serialize())
 
-
+    def launch_training(self, graph_training_cycles, distance_scalings, energy_reward, training_set_file_name, last_golden):
+        cells_with_graphs = [cell for cell in self.cells if cell.has_graph]
+        if 50 < len(cells_with_graphs):
+            output_queue = mp.Queue()
+            use_multiprocess = True
+            if use_multiprocess:
+                training_process = mp.Process(target=train, args=[
+                    np.stack([cell.create_node_export_data() for cell in self.cells]),
+                    [field.shape for field in self._fields],
+                    graph_training_cycles,
+                    np.array(distance_scalings),
+                    energy_reward,
+                    training_set_file_name,
+                    output_queue,
+                    last_golden
+                ])
+                training_process.start()
+            else:
+                train(
+                    np.stack([cell.create_node_export_data() for cell in self.cells]),
+                    [field.shape for field in self._fields],
+                    graph_training_cycles,
+                    np.array(distance_scalings),
+                    energy_reward,
+                    training_set_file_name,
+                    output_queue,
+                    last_golden
+                )
+            path = output_queue.get()
+            step_times = output_queue.get()
+            step_losses = output_queue.get(),
+            golden_graph = output_queue.get()
+            step_rewards = output_queue.get()
+            return step_times, step_losses, golden_graph, step_rewards
 
     def manage_energy_transfer(self, transfer_list, cell_positions_tensor, hidden_states):
         if 0 < len(transfer_list):
@@ -204,9 +247,10 @@ class Ecosystem:
             for transfer_cell_target_and_key, target_cell_index in zip(transfer_list, tf.argmin(distances, axis=0)):
                 transfer_cell, target, key = transfer_cell_target_and_key
                 target_cell = self.cells[target_cell_index]
-                transfer_amount = target_cell.accept_energy(tf.concat([key, hidden_states[target_cell_index]], axis=0))
-                transfer_cell.conclude_transmit(transfer_amount)
-
+                transfer_amount = target_cell.compute_transmit_amount(tf.concat([key, hidden_states[target_cell_index]], axis=0))
+                clipped_transmit_amount = max(0, min([transfer_amount, target_cell.energy, transfer_cell.energy]))
+                target_cell.conclude_transmit(-1 * clipped_transmit_amount)
+                transfer_cell.conclude_transmit(clipped_transmit_amount)
 
     def mate_cells(self, mating_list, cell_positions_tensor):
         new_indices = []
@@ -233,6 +277,8 @@ class Ecosystem:
                          mating_cell_and_target[0].x,
                          mating_cell_and_target[0].y,
                          mating_cell_and_target[0].z)
+                if self.cells[replacement_index].golden_lock:
+                    raise Exception("Replacing golden cell")
                 self.cells[replacement_index] = new_cell
                 updating_position_tensor[replacement_index][0] = mating_cell_and_target[0].w
                 updating_position_tensor[replacement_index][1] = mating_cell_and_target[0].x
@@ -240,11 +286,6 @@ class Ecosystem:
                 updating_position_tensor[replacement_index][3] = mating_cell_and_target[0].z
                 new_indices.append(replacement_index)
             return tf.constant(updating_position_tensor), new_indices
-
-
-
-
-
 
     def profile_field_ops(self):
         return {"field_shift_times": sum(field.field_shift_times for field in self._fields),
@@ -256,7 +297,6 @@ class Ecosystem:
                 "multiply_times": sum(field.multiply_times for field in self._fields),
                 "add_times": sum(field.add_times for field in self._fields),
                 "bell_times": sum(field.bell_times for field in self._fields)}
-
 
     def test_scaling(self):
         pass

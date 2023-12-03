@@ -1,20 +1,18 @@
 import tensorflow as tf
 import numpy as np
-from CellEnums import ChromosomeSet, ActionSet
-from typing import Tuple
+from CellConstants import ChromosomeSet, ActionSet, CELL_CENTRAL_LAYER_COUNT, CELL_CENTRAL_LAYER_SIZE, GENERATION_KEY_SIZE, ENVIRONMENT_DIMENSIONS
+from typing import Tuple, List
 from Field import Field
+from Cell import Cell
 import time
 
-CELL_CENTRAL_LAYER_COUNT = 8
-CELL_CENTRAL_LAYER_SIZE = 32
-GENERATION_KEY_SIZE = 8
 
-def generate_cell_context(cell_field_selections, cell_signal_field_values, cells, cell_rewards):
+def generate_cell_context(cell_signal_field_values, cells):
     w_1, b_1, w_2, b_2 = \
         batch_genes(cells, ChromosomeSet.RECEPTORS, 4)
     receptor_hidden = tf.nn.relu(tf.einsum("cds,cdso->co", cell_signal_field_values, w_1) + b_1)
     receptor_outputs = tf.einsum("cv,cvo->co", receptor_hidden, w_2) + b_2
-    return tf.concat([cell_field_selections, receptor_outputs, cell_rewards], axis=1)
+    return receptor_outputs
 
 def batch_genes(cells, chromosome : ChromosomeSet, chromosome_size):
     cell_genes = tuple(cell.provide_chromosome(chromosome) for cell in cells)
@@ -22,8 +20,9 @@ def batch_genes(cells, chromosome : ChromosomeSet, chromosome_size):
         yield tf.stack(tuple(gene[gene_index] for gene in cell_genes))
 
 
-def update_hidden(hidden_states, context_hints, cells, cell_epigenetics):
-    state_0 = tf.concat((hidden_states, context_hints), axis=1)
+def update_hidden(hidden_states, cell_signal_field_values, cells, cell_epigenetics):
+    cell_internal_context_matrix = tf.stack([cell.provide_signal_input() for cell in cells])
+    state_0 = tf.concat((hidden_states, cell_signal_field_values, cell_internal_context_matrix), axis=1)
     w_1, b_1, w_2, b_2, w_3, b_3, w_4, b_4, w_5, b_5, w_6, b_6, w_7, b_7, w_8, b_8 = \
         batch_genes(cells, ChromosomeSet.MAIN, 16)
     state_1 = tf.nn.relu(tf.multiply(tf.einsum('cik,ci->ck', w_1, state_0) + b_1, cell_epigenetics[:, 0, :]))
@@ -56,17 +55,18 @@ def batch_precalc_genes(precalc_genes, action_selection):
        tf.gather(tf.stack(w2_array), action_selection, axis=1, batch_dims=1), \
        tf.gather(tf.stack(b2_array), action_selection, axis=1, batch_dims=1)
 
-def select_action(hidden_states, cells, cell_action_filters):
+def select_action(hidden_states, cells):
+    cell_action_filters = tf.stack([cell.action_mask for cell in cells])
     w1, b1, w2, b2, w3, b3 = batch_genes(cells, ChromosomeSet.SELECT, 6)
     selection_state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, hidden_states) + b1))
     selection_state_2 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w2, selection_state_1) + b2))
-    selection_heat = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w3, selection_state_2) + b3))
+    selection_heat = tf.nn.sigmoid(tf.nn.relu(tf.einsum('cik,ci->ck', w3, selection_state_2) + b3)) + 0.01
     masked_selection_heats = tf.multiply(selection_heat, cell_action_filters)
     # Selects the action with the highest selection favorability calculation within the permitted actions for the cell.
     action_selections = tf.argmax(masked_selection_heats, axis=1, output_type=tf.int32)
 
     action_w1, action_b1, action_w2, action_b2 = batch_precalc_genes(
-        (cell.provide_chromosome(ChromosomeSet.ACTION_OPERATOR_SET) for cell in cells),
+        (cell.provide_chromosome(ChromosomeSet.ACTION_PRECALCULATION_SET) for cell in cells),
         action_selections)
     state_1 = tf.nn.relu(tf.einsum('cik,ci->ck', action_w1, hidden_states) + action_b1)
     action_instructions_precalculation = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', action_w2, state_1) + action_b2))
@@ -76,62 +76,111 @@ def select_action(hidden_states, cells, cell_action_filters):
 def perform_reset(hidden_state_list, cells):
     if 0 < len(hidden_state_list):
         action_states = tf.stack(hidden_state_list, axis=0)
-        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR, 2)
         state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1))
         for cell, field_selection in zip(cells, tf.argmax(state_1, axis=1)):
-            cell.reset(int(field_selection))
+            cell.reset()
 
 
 def perform_field_shift(hidden_state_list, cells, fields: Tuple[Field]):
     if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.FIELD_SHIFT]
         action_states = tf.stack(hidden_state_list, axis=0)
-        cell_field_shift_allowances = tf.stack(tuple(fields[cell.field_index].field_shift_allowances for cell in cells))
-        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR, 2)
         state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1))
         normalized_field_shift_values = tf.math.sigmoid(state_1) + .01
-        field_shift_heat_map = tf.multiply(normalized_field_shift_values, cell_field_shift_allowances)
-        for cell, field_selection in zip(cells, tf.argmax(field_shift_heat_map, axis=1)):
-            cell.add_field_shift(int(field_selection))
+        operating_field_selection_values, target_field_selection_values = tf.split(normalized_field_shift_values, num_or_size_splits=2, axis=1)
+        operating_field_heat_map = tf.multiply(operating_field_selection_values, operating_field_options)
+        for cell, operating_field_selection, target_field_selection in zip(
+                cells,
+                tf.argmax(operating_field_heat_map, axis=1),
+                target_field_selection_values
+        ):
+            field_with = tf.argmax(
+                tf.multiply(
+                        target_field_selection,
+                        fields[int(operating_field_selection)].field_shift_allowances
+            ))
+            cell.add_field_shift(int(operating_field_selection), int(field_with))
 
 
-def perform_projection(hidden_state_list, cells, field_count):
+def perform_projection(hidden_state_list, cells, fields: Tuple[Field]):
     if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.PROJECTION]
         action_states = tf.stack(hidden_state_list, axis=0)
-        cell_projection_allowances = tf.stack(tuple(cell.current_output_field.projection_allowances for cell in cells))
-        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR_AND_KEY, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR_AND_KEY, 2)
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
-        projection_values, keys = tf.split(state_1, [field_count, 16], axis=1)
+        projection_values, keys = tf.split(state_1, [len(fields) * 2, 16], axis=1)
         normalized_projection_values = tf.math.sigmoid(projection_values) + .01
-        perform_projection_heat_map = tf.multiply(normalized_projection_values, cell_projection_allowances)
-        for cell, field_selection, cell_key in zip(cells, tf.argmax(perform_projection_heat_map, axis=1), keys):
-            cell.add_projection(int(field_selection), cell_key)
+        operating_field_selection_values, target_field_selection_values = tf.split(normalized_projection_values, num_or_size_splits=2, axis=1)
+        operating_field_heat_map = tf.multiply(operating_field_selection_values, operating_field_options)
+        for cell, operating_field_selection, target_field_selection, cell_key in zip(
+                    cells,
+                    tf.argmax(operating_field_heat_map, axis=1),
+                    target_field_selection_values,
+                    keys
+        ):
+            field_to = tf.argmax(
+                tf.multiply(
+                        target_field_selection,
+                        fields[int(operating_field_selection)].projection_allowances
+                )
+            )
+            cell.add_projection(int(operating_field_selection), int(field_to), cell_key)
 
 
-"""
-def perform_softmax(hidden_states, cell_genes):
-    state_1 = tf.nn.relu(tf.matmul(cell_genes[0][0], hidden_states) + cell_genes[0][1])
-    state_2 = tf.math.atan(tf.nn.relu(tf.matmul(cell_genes[1][0], state_1) + cell_genes[1][1]))
-    pass
-"""
-
-
-def perform_einsum(hidden_state_list, cells):
+def perform_softmax(hidden_state_list, cells):
     if 0 < len(hidden_state_list):
         action_states = tf.stack(hidden_state_list, axis=0)
-        cell_einsum_allowances = tf.stack(tuple(cell.current_output_field.einsum_allowances for cell in cells))
-        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FILED_SELECTOR, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+        state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1))
+        operating_field_heat_map = tf.math.sigmoid(state_1) + .01
+        for cell, operating_field_selection in zip(
+                cells,
+                tf.argmax(operating_field_heat_map, axis=1)
+        ):
+            cell.add_softmax(int(operating_field_selection))
+
+def perform_bell(hidden_state_list, cells):
+    if 0 < len(hidden_state_list):
+        action_states = tf.stack(hidden_state_list, axis=0)
+        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+        state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1))
+        operating_field_heat_map = tf.math.sigmoid(state_1) + .01
+        for cell, operating_field_selection in zip(
+                cells,
+                tf.argmax(operating_field_heat_map, axis=1)
+        ):
+            cell.add_bell(int(operating_field_selection))
+
+def perform_einsum(hidden_state_list, cells, fields: Tuple[Field]):
+    if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.EINSUM]
+        action_states = tf.stack(hidden_state_list, axis=0)
+        w1, b1 = batch_genes(cells, ChromosomeSet.TRIPLE_FILED_SELECTOR, 2)
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
         normalized_state_1 = tf.math.sigmoid(state_1) + .01
-        field_with_selection_source, field_to_selection_source = tf.split(normalized_state_1, 2, axis=1)
-        einsum_heat_map_with = tf.multiply(field_with_selection_source, cell_einsum_allowances)
-        for cell, field_selection_with, cell_normalized_einsum_to_values in zip(cells, tf.argmax(einsum_heat_map_with, axis=1), field_to_selection_source):
-            cell_einsum_allowances_with = cell.current_output_field.einsum_allowances_with[int(field_selection_with)]
+        operating_field_selection_source, field_with_selection_source, field_to_selection_source = tf.split(normalized_state_1, 3, axis=1)
+        operating_field_heat_map = tf.multiply(field_with_selection_source, operating_field_options)
+        for cell, operating_field, cell_normalized_einsum_with_values, cell_normalized_einsum_to_values in zip(
+                cells,
+                tf.argmax(operating_field_heat_map, axis=1),
+                field_with_selection_source,
+                field_to_selection_source
+        ):
+            field_selection_with = tf.argmax(
+                                 tf.multiply(
+                                     cell_normalized_einsum_with_values,
+                                     fields[int(operating_field)].einsum_allowances
+                                 )
+                             )
+            cell_einsum_allowances_with = fields[int(operating_field)].einsum_allowances_with[int(field_selection_with)]
             field_shift_heat_map_to = tf.multiply(cell_normalized_einsum_to_values, cell_einsum_allowances_with)
             field_selection_to = tf.argmax(field_shift_heat_map_to)
-            cell.add_einsum(int(field_selection_with), int(field_selection_to))
+            cell.add_einsum(int(operating_field), int(field_selection_with), int(field_selection_to))
 
 
-def perform_conv(hidden_state_action_list, cells, field_count):
+def perform_conv(hidden_state_action_list, cells, fields: Tuple[Field]):
     """
     Updates a deep learning graph contained within a list of cells.
 
@@ -150,72 +199,94 @@ def perform_conv(hidden_state_action_list, cells, field_count):
     None. The function updates the cells by adding a convolution layer to each of them.
     """
     if 0 < len(hidden_state_action_list):
+        # Gets the list of fields which offer the option of a convolution operation
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.CONV]
         # Consolidate the hidden states provided for each cell into a single tensor to be operated on in a single operation
         action_states = tf.stack(hidden_state_action_list, axis=0)
-        # conv_allowances indicates which other fields a given field can output to using a convolution operation
-        field_conv_selection_mask = tf.stack(tuple(cell.current_output_field.conv_allowances for cell in cells))
         # Get the parameters used in the instructions to add convolution operations to organisms
-        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR_AND_KEY, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR_AND_KEY, 2)
         # Finalize the instructions by computing the einsum between the cells' precalculated action state and a weight tensor, and adding a bias tensor
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
         # Break out the components of the chromosome evaluation for their separate roles in building the cell graph
-        field_with_selection_source, kernel_generation_seed = tf.split(state_1, [field_count, 2 * GENERATION_KEY_SIZE], axis=1)
+        field_with_selection_source, kernel_generation_seed = tf.split(state_1, [len(fields) * 2, 2 * GENERATION_KEY_SIZE], axis=1)
         # Ensure that all values in the heat map used to select the target field of the convolution operation are positive
-        # This ensures that the selected field is contained in field_conv_selection_mask
-        normalized_field_with_selection_source = tf.math.sigmoid(field_with_selection_source) + .01
-        # Multiply state_1 by the field_conv_selection_mask to create a tensor of values indicating the preference of each organism to generate an output to each field
-        conv_heat_map = tf.multiply(normalized_field_with_selection_source, field_conv_selection_mask)
-        # Loop through each cell, field_selection, and kernel_generation_seed
-        for cell, field_selection, cell_kernel_generation_seed in zip(cells, tf.argmax(conv_heat_map, axis=1), kernel_generation_seed):
+        # This ensures that the selected field is contained in the selection masks
+        normalized_field_to_selection_source = tf.math.sigmoid(field_with_selection_source) + .01
+        # Split the selection sources into two sets, one for the operating field and one for the target field
+        operating_field_selection_values, target_field_selection_values = tf.split(normalized_field_to_selection_source, num_or_size_splits=2, axis=1)
+        # Filters operating_field_selection_values by the list of options to compute the cell's preference for each
+        # field as the operating field
+        operating_field_heat_map = tf.multiply(operating_field_selection_values, operating_field_options)
+        # Loop through each cell and its corresponding data
+        for cell, operating_field_selection, cell_target_field_selection_values, cell_kernel_generation_seed in zip(cells, tf.argmax(operating_field_heat_map, axis=1), target_field_selection_values, kernel_generation_seed):
+            # Find the field that the cell most prefers to set the convolution operation output to
+            field_to = tf.argmax(
+                tf.multiply(
+                        cell_target_field_selection_values,
+                        fields[int(operating_field_selection)].projection_allowances
+                )
+            )
             # Add a convolution layer to the organism, which will output to the field indicated by field_selection and
             # use weights and biases generated pseudorandomly using the value in kernel_generation_seed
             # The cell's field_index property will be updated to the value of field_selection
-            cell.add_conv(int(field_selection), cell_kernel_generation_seed)
+            cell.add_conv(int(operating_field_selection), int(field_to), cell_kernel_generation_seed)
 
 @tf.function
-def update_scalings(changed_positions, all_positions, old_distance_scalings, scaling_gather_indices):
+def update_distances(changed_positions, all_positions):
     changed_positions_ex = tf.expand_dims(changed_positions, axis=0)
     new_positions_ex = tf.expand_dims(all_positions, axis=1)
     squared_diffs = tf.square(changed_positions_ex - new_positions_ex)
     distances = tf.sqrt(tf.reduce_sum(squared_diffs, axis=-1))
+    return distances
+
+@tf.function(
+    input_signature=[
+        tf.TensorSpec(shape=[None, None], dtype=tf.float32),
+        tf.TensorSpec(shape=[None, None], dtype=tf.float32),
+        tf.TensorSpec(shape=[None], dtype=tf.int32)
+    ]
+)
+def scalings_from_distances(distances, old_distance_scalings, scaling_gather_indices):
     distance_scalings_updates = 1 / tf.square(1 + distances)
     distance_scalings_concat_1 = tf.concat([old_distance_scalings, distance_scalings_updates], axis=1)
     distance_scalings_update_1 = tf.gather(distance_scalings_concat_1, scaling_gather_indices, axis=1)
     distance_scalings_concat_2 = tf.concat([tf.transpose(distance_scalings_update_1, [1, 0]), distance_scalings_updates], axis=1)
     unmasked_updated_scalings = tf.gather(distance_scalings_concat_2, scaling_gather_indices, axis=1)
-    updated_scalings = tf.multiply(unmasked_updated_scalings, 1.0 - tf.eye(tf.shape(all_positions)[0]))
+    updated_scalings = tf.multiply(unmasked_updated_scalings, 1.0 - tf.eye(tf.shape(unmasked_updated_scalings)[0]))
     return updated_scalings
 
+def update_scalings(changed_positions, all_positions, old_distance_scalings, scaling_gather_indices):
+    distances = update_distances(changed_positions, all_positions)
+    return scalings_from_distances(distances, old_distance_scalings, scaling_gather_indices)
 
-
-@tf.function
+@tf.function(
+    input_signature=[
+        tf.TensorSpec(shape=[None, None], dtype=tf.float32),
+        tf.TensorSpec(shape=[None, ENVIRONMENT_DIMENSIONS], dtype=tf.float32),
+        tf.TensorSpec(shape=[None], dtype=tf.int32),
+        tf.TensorSpec(shape=[None], dtype=tf.int32),
+        tf.TensorSpec(shape=[None, None], dtype=tf.float32),
+        tf.TensorSpec(shape=[None], dtype=tf.int32)
+    ]
+)
 def update_positions_and_scalings(state_1, origial_positions, move_gather_arg, updating_indexes, old_distance_scalings, scaling_gather_indices):
     static_and_deltas = tf.concat([tf.zeros([1, 4]), state_1], axis=0)
     new_positions = origial_positions + tf.gather(static_and_deltas, move_gather_arg, axis=0)
-    new_distance_scalings = update_scalings(tf.gather(new_positions, updating_indexes), new_positions, old_distance_scalings, scaling_gather_indices)
+    updated_distances = update_distances(tf.gather(new_positions, updating_indexes), new_positions)
+    new_distance_scalings = scalings_from_distances(updated_distances, old_distance_scalings, scaling_gather_indices)
     return new_positions, new_distance_scalings
 
 
 def perform_move(hidden_state_action_list, cells, origial_positions, move_gather_arg, updating_indexes, distance_scalings, scaling_gather_indices):
-    if 0 < len(hidden_state_action_list):
-        action_states = tf.stack(hidden_state_action_list, axis=0)
-        w1, b1 = batch_genes(cells, ChromosomeSet.DIRECTION_SELECTOR, 2)
-        # Finalize the instructions by computing the einsum between the cells' precalculated action state and a weight tensor, and adding a bias tensor
-        state_1 = tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1)
-        for cell, direction in zip(cells, state_1):
-            cell.move(direction[0], direction[1], direction[2], direction[3])
+    action_states = tf.stack(hidden_state_action_list, axis=0)
+    w1, b1 = batch_genes(cells, ChromosomeSet.DIRECTION_SELECTOR, 2)
+    # Finalize the instructions by computing the einsum between the cells' precalculated action state and a weight tensor, and adding a bias tensor
+    state_1 = tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1)
+    for cell, direction in zip(cells, state_1):
+        cell.move(direction[0], direction[1], direction[2], direction[3])
 
-        new_positions, new_distance_scalings = update_positions_and_scalings(state_1, origial_positions, move_gather_arg, updating_indexes, distance_scalings, scaling_gather_indices)
-        return new_positions, new_distance_scalings
-    else:
-        if distance_scalings is None:
-            changed_positions_ex = tf.expand_dims(origial_positions, axis=0)
-            new_positions_ex = tf.expand_dims(origial_positions, axis=1)
-            squared_diffs = tf.square(changed_positions_ex - new_positions_ex)
-            distances = tf.sqrt(tf.reduce_sum(squared_diffs, axis=-1))
-            distance_scalings_unmasked = 1 / tf.square(1 + distances)
-            distance_scalings = tf.multiply(distance_scalings_unmasked, 1.0 - tf.eye(tf.shape(origial_positions)[0]))
-        return origial_positions, distance_scalings
+    new_positions, new_distance_scalings = update_positions_and_scalings(state_1, origial_positions, tf.constant(move_gather_arg), tf.constant(updating_indexes), distance_scalings, tf.constant(scaling_gather_indices))
+    return new_positions, new_distance_scalings
 
 
 def perform_mate(hidden_state_list, cells, mating_list):
@@ -261,21 +332,31 @@ def perform_transfer_energy(hidden_state_list, cells, transfer_list):
             transfer_list.append((cell, direction + tf.constant(np.array([cell.w, cell.x, cell.y, cell.z], dtype=np.float32)), key))
 
 
-def perform_concat(hidden_state_list, cells):
+def perform_concat(hidden_state_list, cells, fields: Tuple[Field]):
     if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.CONCAT]
         action_states = tf.stack(hidden_state_list, axis=0)
-        cell_field_shift_allowances = tf.stack(tuple(cell.current_output_field.concat_allowances for cell in cells))
-        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FILED_SELECTOR, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.TRIPLE_FILED_SELECTOR, 2)
         state_1 = tf.math.atan(tf.nn.relu(tf.einsum('cik,ci->ck', w1, action_states) + b1))
         normalized_state_1 = tf.math.sigmoid(state_1) + .01
-        field_with_selection_source, field_to_selection_source = tf.split(normalized_state_1, 2, axis=1)
-        concat_heat_map = tf.multiply(field_with_selection_source, cell_field_shift_allowances)
-        for cell, field_selection, cell_field_to_selection_source in zip(cells, tf.argmax(concat_heat_map, axis=1), field_to_selection_source):
-            to_allowances = cell.current_output_field.concat_to_allowances(int(field_selection))
-            concat_to_heat_map = tf.multiply(cell_field_to_selection_source, to_allowances)
-            to_selection = int(tf.argmax(concat_to_heat_map))
+        operating_field_selection_source, field_with_selection_source, field_to_selection_source = tf.split(normalized_state_1, 3, axis=1)
+        operating_field_heat_map = tf.multiply(field_with_selection_source, operating_field_options)
+        for cell, operating_field, cell_normalized_einsum_with_values, cell_normalized_einsum_to_values in zip(
+                        cells,
+                        tf.argmax(operating_field_heat_map, axis=1),
+                        field_with_selection_source,
+                        field_to_selection_source):
+            field_selection_with = tf.argmax(
+                                 tf.multiply(
+                                     cell_normalized_einsum_with_values,
+                                     fields[int(operating_field)].concat_allowances
+                                 )
+                             )
+            cell_concat_allowances_with = fields[int(operating_field)].concat_to_allowances(int(field_selection_with))
+            field_shift_heat_map_to = tf.multiply(cell_normalized_einsum_to_values, cell_concat_allowances_with)
+            field_selection_to = tf.argmax(field_shift_heat_map_to)
 
-            cell.add_concat(int(field_selection), int(to_selection))
+            cell.add_concat(int(operating_field), int(field_selection_with), int(field_selection_to))
 
 def perform_multiply(hidden_state_list, cells, fields):
     """
@@ -297,23 +378,32 @@ def perform_multiply(hidden_state_list, cells, fields):
     None. The function updates the cells by adding a multiplication layer to each of them.
     """
     if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.MULTIPLY]
         # Consolidate the hidden states provided for each cell into a single tensor to be operated on in a single operation
         action_states = tf.stack(hidden_state_list, axis=0)
-        # conv_allowances indicates which other fields a given field can output to using a convolution operation
-        divide_selection_mask = tf.stack(tuple(fields[cell.field_index].elementwise_allowances for cell in cells))
         # Get the parameters used in the instructions to add convolution operations to organisms
-        w1, b1 = batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+        w1, b1 = batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR, 2)
         # Use the feched parameters to finish calculating the instructions for the operation
         state_1 = tf.einsum('cik,ci->ck', w1, action_states) + b1
-        normalized_field_with_selection_source = tf.math.sigmoid(state_1) + .01
-        # Multiply state_1 by the field_conv_selection_mask to create a tensor of values indicating the preference of each organism to generate an output to each field
-        divide_heat_map = tf.multiply(normalized_field_with_selection_source, divide_selection_mask)
-        # Loop through each cell, field_selection, and kernel_generation_seed
-        for cell, field_selection in zip(cells, tf.argmax(divide_heat_map, axis=1)):
+        normalized_field_selection_source = tf.math.sigmoid(state_1) + .01
+        # Splits the selection sources by role
+        operating_field_selection_values, target_field_selection_values = tf.split(normalized_field_selection_source, num_or_size_splits=2, axis=1)
+        # Filters operating_field_selection_values by the list of options to compute the cell's preference for each
+        # field as the operating field
+        operating_field_heat_map = tf.multiply(operating_field_selection_values, operating_field_options)
+        # Loop through each cell and its corresponding data
+        for cell, operating_field_selection, cell_target_field in zip(cells, tf.argmax(operating_field_heat_map, axis=1), target_field_selection_values):
+            # Find the field that the cell most prefers to set the multiply operation output to
+            field_with = tf.argmax(
+                tf.multiply(
+                        cell_target_field,
+                        fields[int(operating_field_selection)].elementwise_allowances
+                )
+            )
             # Add a convolution layer to the organism, which will output to the field indicated by field_selection and
             # use weights and biases generated pseudorandomly using the value in kernel_generation_seed
             # The cell's field_index property will be updated to the value of field_selection
-            cell.add_multiply(int(field_selection))
+            cell.add_multiply(int(operating_field_selection), int(field_with))
 
 def perform_add(hidden_state_list, cells, fields):
     """
@@ -335,24 +425,33 @@ def perform_add(hidden_state_list, cells, fields):
     None. The function updates the cells by adding a convolution layer to each of them.
     """
     if 0 < len(hidden_state_list):
+        operating_field_options = np.stack([field.action_mask for field in fields])[:, ActionSet.ADD]
         # Consolidate the hidden states provided for each cell into a single tensor to be operated on in a single operation
         action_states = tf.stack(hidden_state_list, axis=0)
-        # conv_allowances indicates which other fields a given field can output to using a convolution operation
-        add_selection_mask = tf.stack(tuple(fields[cell.field_index].elementwise_allowances for cell in cells))
         # Get the parameters used in the instructions to add convolution operations to organisms
         w1, b1 = \
-            batch_genes(cells, ChromosomeSet.SINGLE_FIELD_SELECTOR, 2)
+            batch_genes(cells, ChromosomeSet.DOUBLE_FIELD_SELECTOR, 2)
         # Finalize the instructions by computing the einsum between the cells' precalculated action state and a weight tensor, and adding a bias tensor
         state_3 = tf.einsum('cik,ci->ck', w1, action_states) + b1
-        normalized_field_with_selection_source = tf.math.sigmoid(state_3) + .01
-        # Multiply state_3 by the field_conv_selection_mask to create a tensor of values indicating the preference of each organism to generate an output to each field
-        add_heat_map = tf.multiply(normalized_field_with_selection_source, add_selection_mask)
-        # Loop through each cell, field_selection, and kernel_generation_seed
-        for cell, field_selection in zip(cells, tf.argmax(add_heat_map, axis=1)):
+        normalized_field_selection_source = tf.math.sigmoid(state_3) + .01
+        # Splits the selection sources by role
+        operating_field_selection_values, target_field_selection_values = tf.split(normalized_field_selection_source, num_or_size_splits=2, axis=1)
+        # Filters operating_field_selection_values by the list of options to compute the cell's preference for each
+        # field as the operating field
+        operating_field_heat_map = tf.multiply(operating_field_selection_values, operating_field_options)
+        # Loop through each cell and its corresponding data
+        for cell, operating_field_selection, cell_target_field_selection_values in zip(cells, tf.argmax(operating_field_heat_map, axis=1), target_field_selection_values):
+            # Find the field that the cell most prefers to set the add operation output to
+            field_with = tf.argmax(
+                tf.multiply(
+                        cell_target_field_selection_values,
+                        fields[int(operating_field_selection)].elementwise_allowances
+                )
+            )
             # Add a convolution layer to the organism, which will output to the field indicated by field_selection and
             # use weights and biases generated pseudorandomly using the value in kernel_generation_seed
             # The cell's field_index property will be updated to the value of field_selection
-            cell.add_add(int(field_selection))
+            cell.add_add(int(operating_field_selection), int(field_with))
 
 @tf.function
 def calculate_masked_distances(distance_scaling, cell_count, cell_positions):
@@ -389,43 +488,41 @@ def perform_signal(cells, hidden_states, cell_positions, distance_scalings):
         # signal_duration = time.time() - signal_calc_start
         return cell_signal_inputs
 
-def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values, mating_list, transfer_list, cell_positions, cell_distance_scalings):
-    cell_action_filters = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    # cell_energy = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    # cell_reward = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    # cell_transmit_reward = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    # cell_receive_reward = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    field_selections = np.zeros([len(cells), len(fields)], dtype=np.float32)
-    cell_rewards = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    # times = []
-    # times.append(time.time())
-    for cell_index, cell in enumerate(cells):
-        # field_selection = np.zeros(len(fields))
-        field_selections[cell_index, cell.field_index] = 1.0
-        # field_selections = field_selections.write(cell_index, field_selection)
-        cell_action_filters = cell_action_filters.write(cell_index, cell.action_mask)
-        cell_rewards = cell_rewards.write(cell_index, [cell.energy, cell.last_reward, cell.last_transmit_reward, cell.last_receive_reward])
-        # cell_reward = cell_reward.write(cell_index, [])
-        # cell_transmit_reward = cell_transmit_reward.write(cell_index, [])
-        # cell_receive_reward = cell_receive_reward.write(cell_index, [])
+def operate(cells: List[Cell], fields : Tuple[Field], cell_hidden_states, cell_signal_values, mating_list, transfer_list, cell_positions, cell_distance_scalings):
+    """
+        Simulates one time-step of cell operations within the ecosystem.
+
+        Args:
+            cells (list[Cell]): A list of cells in the ecosystem.
+            fields (Tuple[Field]): A tuple of fields within which cells operate.
+            cell_hidden_states (tf.Tensor): Current hidden states of all cells.
+            cell_signal_values (tf.Tensor): Current signal values of all cells.
+            mating_list (list): A list to capture cells that wish to mate this timestep.
+            transfer_list (list): A list to capture cells that wish to transfer energy this timestep.
+            cell_positions (tf.Tensor): Current positions of all cells within the ecosystem.
+            cell_distance_scalings (tf.Tensor): Distance scalings of cells.
+
+        Returns:
+            tuple: Updated values of:
+                - cell_hidden_states (tf.Tensor): New hidden states of cells post operation.
+                - cell_positions (tf.Tensor): New positions of cells post operation.
+                - cell_signal_values (tf.Tensor): New signal values of cells post operation.
+                - cell_distance_scalings (tf.Tensor): Updated distance scalings.
+
+        Notes:
+            This function simulates the activities of each cell for one timestep based on their internal states,
+            field conditions, and interactions with other cells. Each cell can perform a variety of operations such
+            as moving, mating, and transferring energy, based on its current state and the action it decides to
+            take. The resulting state of each cell, and their new positions in the field, are updated and returned.
+    """
     # times.append(time.time())
     context_hints = generate_cell_context(
-        tf.constant(field_selections),
         cell_signal_values,
-        cells,
-        cell_rewards.stack(),
-        # cell_reward.stack(),
-        # cell_transmit_reward.stack(),
-        # cell_receive_reward.stack()
+        cells
     )
     cell_epigenetics = tf.stack([cell.epigenetics for cell in cells], axis=0)
-    # for epigene_index in range(CELL_CENTRAL_LAYER_COUNT):
-    #     epigene = tf.TensorArray(dtype=tf.float32, size=len(cells))
-    #     for cell_index, cell in enumerate(cells):
-    #         epigene = epigene.write(cell_index, cell.provide_epigenes(epigene_index))
-    #     cell_epigenetics.append(epigene.stack())
     new_hidden = update_hidden(cell_hidden_states, context_hints, cells, cell_epigenetics)
-    cell_selections, action_states = select_action(new_hidden, cells, cell_action_filters.stack())
+    cell_selections, action_states = select_action(new_hidden, cells)
     reset_data = []
     field_shift_data = []
     projection_data = []
@@ -497,25 +594,30 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     perform_projection(
         tf.gather(action_states, np.array(tuple(data[1] for data in projection_data), dtype=np.int32)),
         tuple(data[0] for data in projection_data),
-        len(fields)
+        fields
     )
     # times.append(time.time())
     # actions.append("projection")
     # action_cell_counts.append(len(projection_data))
-    for cell, cell_index in softmax_data:
-        cell.add_softmax()
+    perform_softmax(
+        tf.gather(action_states, np.array(tuple(data[1] for data in softmax_data), dtype=np.int32)),
+        tuple(data[0] for data in softmax_data)
+    )
 
     # times.append(time.time())
     # actions.append("softmax")
     # action_cell_counts.append(len(softmax_data))
-    for cell, cell_index in bell_data:
-        cell.add_bell()
+    perform_bell(
+        tf.gather(action_states, np.array(tuple(data[1] for data in bell_data), dtype=np.int32)),
+        tuple(data[0] for data in bell_data)
+        )
     # times.append(time.time())
     # actions.append("bell")
     # action_cell_counts.append(len(bell_data))
     perform_einsum(
         tf.gather(action_states, np.array(tuple(data[1] for data in einsum_data), dtype=np.int32)),
-        tuple(data[0] for data in einsum_data)
+        tuple(data[0] for data in einsum_data),
+        fields
     )
     # times.append(time.time())
     # actions.append("einsum")
@@ -523,7 +625,7 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     perform_conv(
         tf.gather(action_states, np.array(tuple(data[1] for data in conv_data), dtype=np.int32)),
         tuple(data[0] for data in conv_data),
-        len(fields)
+        fields
     )
     # times.append(time.time())
     # actions.append("conv")
@@ -579,7 +681,8 @@ def operate(cells, fields : Tuple[Field], cell_hidden_states, cell_signal_values
     # action_cell_counts.append(len(transfer_energy_data))
     perform_concat(
         tf.gather(action_states, np.array(tuple(data[1] for data in concat_data), dtype=np.int32)),
-        tuple(data[0] for data in concat_data)
+        tuple(data[0] for data in concat_data),
+        fields
     )
     # times.append(time.time())
     # actions.append("concat")
