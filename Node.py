@@ -151,7 +151,7 @@ class Node:
         return self.left_index == field_index or \
             (-1 != self.right_index and self.right_index == field_index)
 
-    def make_node_eval(self, test_mode, fields, training_variable, hot_node_id):
+    def make_node_eval(self, test_mode, fields, training_variable, hot_node_id, pruning_training_var):
         """
         Creates a function for evaluating the node.
 
@@ -189,7 +189,7 @@ class Node:
                 node_op_states = dict()
                 for assemble_op in assemble_inputs:
                     assemble_op(node_op_states)
-                op_return = node_op(node_op_states) * self.training_variable
+                op_return = node_op(node_op_states) * self.training_variable * pruning_training_var
                 tf.debugging.check_numerics(op_return, "Node result had invalid data")
                 self.emitted_value = op_return
         else:

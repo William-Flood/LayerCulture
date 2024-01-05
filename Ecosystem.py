@@ -6,10 +6,8 @@ from Cell import Cell, breed_cells
 from CellBatchOperator import CELL_CENTRAL_LAYER_SIZE, CELL_CENTRAL_LAYER_COUNT, operate, update_scalings
 import time
 import multiprocessing as mp
-from threading import Thread
-from queue import Queue
 from train import train
-
+from typing import Tuple
 
 
 def make_ecosystem(fields_shapes):
@@ -22,6 +20,7 @@ def tile_to_mutations(gene, generated_family_size):
         tf.reshape(gene, tf.pad(tf.shape(gene), paddings=[[1, 0]], constant_values=1)),
         tf.pad(tf.ones(tf.shape(tf.shape(gene)), dtype=tf.int32), paddings=[[1, 0]],
                constant_values=generated_family_size))
+
 
 def create_create_mutations(total_mutation_size, total_chomosome_sizes, genome_gene_shapes):
     flat_gene_sizes = [[tf.reduce_prod(gene_size) for gene_size in chromosome_size] for chromosome_size in
@@ -55,7 +54,7 @@ def create_create_mutations(total_mutation_size, total_chomosome_sizes, genome_g
 
 class Ecosystem:
     def __init__(self, fields_shapes, initial_cell_groups=1000, generated_family_size=10, total_graph_node_count=1000, mutation_rate=0.01):
-        self._fields = tuple(Field(fields_shape, field_index) for field_index, fields_shape in enumerate(fields_shapes))
+        self._fields: Tuple[Field] = tuple(Field(fields_shape, field_index) for field_index, fields_shape in enumerate(fields_shapes))
         self.cells = []
         for field in self._fields:
             field.build_graphs(self._fields)
@@ -128,9 +127,9 @@ class Ecosystem:
             )
         return new_cells, cell_positions
 
-
     def simulate(self, simulation_steps, training_set_file_name, output_file, graph_training_cycles=20,
-                 energy_reward=1000):
+                 energy_reward=1000, pruning_cycles=10, cycle_remove_amount=0.25 , prune_sample_trials=8,
+                 prune_reactivation_amount=.05):
 
         mp.set_start_method("forkserver")
         hidden_states = tf.zeros([len(self.cells), CELL_CENTRAL_LAYER_SIZE])
@@ -161,7 +160,8 @@ class Ecosystem:
                                                                          cell_signals, mating_list, transfer_list,
                                                                          cell_positions_tensor, distance_scalings)
             step_times, step_losses, golden_graph, step_rewards = self.launch_training(graph_training_cycles,
-                distance_scalings, energy_reward, training_set_file_name, last_golden)
+                distance_scalings, energy_reward, training_set_file_name, last_golden, pruning_cycles,
+                cycle_remove_amount, prune_sample_trials, prune_reactivation_amount)
             times.append(step_times)
             losses.append(step_losses)
             end_loss_performance = np.average(losses[-1][-5:])
@@ -202,7 +202,8 @@ class Ecosystem:
                     distance_scalings,
                     scaling_gather_indices)
 
-    def launch_training(self, graph_training_cycles, distance_scalings, energy_reward, training_set_file_name, last_golden):
+    def launch_training(self, graph_training_cycles, distance_scalings, energy_reward, training_set_file_name,
+                        last_golden, pruning_cycles, cycle_remove_amount, prune_sample_trials, prune_reactivation_amount):
         cells_with_graphs = [cell for cell in self.cells if cell.has_graph]
         if 50 < len(cells_with_graphs):
             output_queue = mp.Queue()
@@ -216,7 +217,11 @@ class Ecosystem:
                     energy_reward,
                     training_set_file_name,
                     output_queue,
-                    last_golden
+                    last_golden,
+                    pruning_cycles,
+                    cycle_remove_amount,
+                    prune_sample_trials,
+                    prune_reactivation_amount
                 ])
                 training_process.start()
             else:
@@ -228,11 +233,16 @@ class Ecosystem:
                     energy_reward,
                     training_set_file_name,
                     output_queue,
-                    last_golden
+                    last_golden,
+                    pruning_cycles,
+                    cycle_remove_amount,
+                    prune_sample_trials,
+                    prune_reactivation_amount
                 )
             path = output_queue.get()
+            print(path)
             step_times = output_queue.get()
-            step_losses = output_queue.get(),
+            step_losses = output_queue.get()
             golden_graph = output_queue.get()
             step_rewards = output_queue.get()
             return step_times, step_losses, golden_graph, step_rewards

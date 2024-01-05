@@ -53,9 +53,10 @@ class Graph:
         self.fields = fields
         self.max_field_edge_count = max_field_edge_count
         self.start_nodes, self.nodes, self.output_nodes = self.generate_graph(max_field_edge_count, distance_scalings)
+        self.available_output_nodes = self.output_nodes
         self.total_nodes = self.nodes
         self.log["graph_serialization"] = self.serialize()
-        self.op, self.training_variables = self.compile()
+        self.op, self.training_variables, self.activation_check_var = self.compile()
         self.evaluation_score = 0
         self.end_loss = None
 
@@ -182,12 +183,19 @@ class Graph:
                                                    weights and biases for both layers.
         """
         edge_training_var = tf.Variable(tf.ones([len(self.nodes), len(self.fields), self.max_field_edge_count, 1]), name="edges")
+        node_count = len([node for node in self.nodes])
+        activation_check_var = tf.Variable(tf.ones([node_count]), dtype=tf.float32)
+        if 0 == node_count:
+            pruning_check_vars = []
+        else:
+            pruning_check_vars = tf.split(activation_check_var, num_or_size_splits=node_count)
         node_ops_and_vars = [node.make_node_eval(
             test_mode=True,
             fields=self.fields,
             training_variable=edge_training_var,
-            hot_node_id=hot_node_id
-        ) for node, hot_node_id in zip(self.nodes, range(len(self.nodes))) if node.is_active]
+            hot_node_id=hot_node_id,
+            pruning_training_var=node_puning_check_var
+        ) for node, hot_node_id, node_puning_check_var in zip(self.nodes, range(len(self.nodes)), pruning_check_vars) if node.is_active]
         start_layer_size = self.fields[0].shape[-1]
         start_w = tf.Variable(tf.random.normal([5, 5, start_layer_size, start_layer_size]), name="start_w")
         start_b = tf.Variable(tf.Variable(tf.zeros([start_layer_size])), name="start_b")
@@ -205,7 +213,7 @@ class Graph:
                 node_op()
             graph_end = tf.reduce_sum(tf.stack([output_node.emitted_value for output_node in self.output_nodes]), axis=0)
             return tf.matmul(graph_end, end_w) + end_b
-        return graph_op, [start_w, start_b, end_w, end_b, edge_training_var]
+        return graph_op, [start_w, start_b, end_w, end_b, edge_training_var], activation_check_var
 
 
 
@@ -233,59 +241,73 @@ class Graph:
         return losses, gradients, times
 
 
-    def prune_nodes(self, training_iter, unscaled_return_mu, output_return_sigma, unscaled_return_sigma, output_return_mu, sample_amount, remove_amount):
+    def prune_nodes(self, training_iter, unscaled_return_mu, output_return_sigma, unscaled_return_sigma, output_return_mu, remove_amount, sample_trials, reactivation_percent):
         active_nodes = [node for node in self.nodes if node.is_active]
-        sample_count = int(len(active_nodes) * sample_amount)
-        removal_candidates = random.sample(active_nodes, sample_count)
-        for node in removal_candidates:
-            node.training_variable.assign(.9)
-        training_vars = [node.training_variable for node in removal_candidates]
-        cycle_batch = next(training_iter)
-        input_val = cycle_batch["inputs"]
-        output_val = cycle_batch["outputs"]
-        with tf.GradientTape() as graph_tape:
-            return_val = (self.op(input_val) - unscaled_return_mu) * (output_return_sigma / unscaled_return_sigma) + output_return_mu
-            loss = tf.reduce_sum(tf.square(return_val - output_val))
-        grads = graph_tape.gradient(loss, training_vars)
-        enumerated_grads = [index_and_grad for index_and_grad in enumerate(grads) if index_and_grad[1] is not None]
-        enumerated_grads.sort(key=lambda eg: eg[1])
-        remove_past_index = int(sample_count * (1 - remove_amount))
-        removed_nodes = [removal_candidates[removal_index] for removal_index, _ in enumerated_grads[remove_past_index:]] \
-            + [removal_candidates[removal_index] for removal_index, grad in enumerate(grads) if grad is None]
-        for node in removed_nodes:
+        last_activations = [node.is_active for node in self.nodes]
+        num_total_nodes = len(self.nodes)
+        # Initialize arrays to store the gradients of each node across trials
+        gradient_records = {node.index: [] for node in active_nodes}
+
+        # Perform backpropagation steps and record gradients
+        for _ in range(sample_trials):
+            cycle_batch = next(training_iter)
+            input_val = cycle_batch["inputs"]
+            output_val = cycle_batch["outputs"]
+            self.activation_check_var.assign(np.random.normal(scale=0.1, size=[num_total_nodes]))
+            with tf.GradientTape() as tape:
+                predicted = (self.op(input_val) - unscaled_return_mu) * (output_return_sigma / unscaled_return_sigma) + output_return_mu
+                loss = tf.reduce_sum(tf.square(predicted - output_val))
+            gradients = tape.gradient(loss, [node.training_variable for node in active_nodes])
+            for node, grad in zip(active_nodes, gradients):
+                if grad is not None:
+                    gradient_records[node.index].append(grad.numpy())
+
+        # Calculate the standard deviation of the gradients for each node
+        gradient_stdevs = {node.index: np.std(gradient_records[node.index], axis=0) for node in active_nodes}
+
+        # Determine nodes to prune based on the smallest standard deviations
+        nodes_to_prune = sorted(active_nodes, key=lambda node: gradient_stdevs[node.index])[
+                         :int(len(active_nodes) * remove_amount)]
+
+        for node in nodes_to_prune:
             node.is_active = False
         for node in active_nodes:
             node.check_still_active()
-        for node in removal_candidates:
-            node.training_variable.assign(1.0)
         self.output_nodes = [node for node in self.output_nodes if node.is_active]
-        for node in self.nodes:
-            node.was_revived = False
         if 0 == len(self.output_nodes):
-            nodes_to_revive = []
-            self.output_nodes = [node for node in self.nodes if node.output_field.field_index == self.fields[-1].field_index]
-            nodes_to_revive.extend(self.output_nodes)
-            for node in self.output_nodes:
-                node.is_active = True
-                node.was_revived = True
-            reviving_nodes = [downstream_node for output_node in self.output_nodes for downstream_node in output_node.accumulate_revival()]
-            nodes_to_revive.extend(reviving_nodes)
-            while 0 < len(reviving_nodes):
-                reviving_nodes = [downstream_node for reviving_node in reviving_nodes for downstream_node in
-                                  reviving_node.accumulate_revival()]
-                nodes_to_revive.extend(reviving_nodes)
-            for node in nodes_to_revive:
-                node.is_active = True
-                node.was_revived = True
-        current_active = [node for node in self.nodes if node.is_active]
-        for node in current_active:
-            node.check_still_active()
-            if not node.is_active:
-                raise Exception("Invalid node active!")
+            for node, was_active in zip(self.nodes, last_activations):
+                node.is_active = was_active
+            self.fortify_graph(reactivation_percent, unscaled_return_mu, output_return_sigma, unscaled_return_sigma, output_return_mu, training_iter)
+        else:
+            self.op, self.training_variables, self.activation_check_var = self.compile()
 
-        self.op, self.training_variables = self.compile()
+    def fortify_graph(self, reactivation_percent, unscaled_return_mu, output_return_sigma, unscaled_return_sigma, output_return_mu, training_iter):
+        while 0 == len(self.output_nodes):
+            self.activation_check_var.assign(np.array([1.0 if node.is_active else 0.01 for node in self.nodes]))
+            current_inactive_nodes = [node for node in self.nodes if not node.is_active]
+            for node in current_inactive_nodes:
+                node.is_active = True
+            self.output_nodes = self.available_output_nodes
+            self.op, self.training_variables, self.activation_check_var = self.compile()
+            cycle_batch = next(training_iter)
+            input_val = cycle_batch["inputs"]
+            output_val = cycle_batch["outputs"]
+            with tf.GradientTape() as tape:
+                predicted = (self.op(input_val) - unscaled_return_mu) * (output_return_sigma / unscaled_return_sigma) + output_return_mu
+                loss = tf.reduce_sum(tf.square(predicted - output_val))
+            inactive_training_variable_gradients = tape.gradient(loss, [node.training_variable for node in current_inactive_nodes])
+            reactivation_threshhold = sorted(inactive_training_variable_gradients)[int(len(current_inactive_nodes) * reactivation_percent)]
+            for node, grad in zip(current_inactive_nodes, inactive_training_variable_gradients):
+                if grad > reactivation_threshhold:
+                    node.is_active = False
 
-    def train(self, training_iter, trainer, training_cycles, pruning_cycles, sample_amount, remove_amount):
+            for node in self.nodes:
+                node.check_still_active()
+
+            self.output_nodes = [node for node in self.output_nodes if node.is_active]
+            self.op, self.training_variables, self.activation_check_var = self.compile()
+
+    def train(self, training_iter, trainer, training_cycles, pruning_cycles, remove_amount, sample_trials, reactivation_percent):
         cycle_batch = next(training_iter)
         input_val = cycle_batch["inputs"]
         output_val = cycle_batch["outputs"]
@@ -296,16 +318,19 @@ class Graph:
         output_return_sigma = tf.math.reduce_std(output_val)
         times_array = []
         losses_array = []
+        active_sources_count = []
         for cycle_index in range(pruning_cycles):
             losses, _, times = self.train_variables(training_cycles, training_iter, unscaled_return_mu, output_return_sigma,
                              unscaled_return_sigma, output_return_mu, trainer)
             times_array.append(np.average(times))
             losses_array.append(losses)
-            self.prune_nodes(training_iter, unscaled_return_mu, output_return_sigma, unscaled_return_sigma, output_return_mu, sample_amount, remove_amount)
-            if cycle_index < (pruning_cycles / 2):
+            self.prune_nodes(training_iter, unscaled_return_mu, output_return_sigma, unscaled_return_sigma,
+                             output_return_mu, remove_amount, sample_trials, reactivation_percent)
+            active_sources_count.append(len([source for source in self.sources if source.node is not None and source.node.is_used and source.node.is_active]))
+            if cycle_index > (pruning_cycles / 2):
                 for source in (source for source in self.hot_sources if source.node.is_active):
                     source.reward_variable += 1.0
-        return np.array(times_array), np.array(losses_array), [source.node is not None and source.node.is_active for source in self.sources]
+        return np.array(times_array), np.array(losses_array), [source.node is not None and source.node.is_used and source.node.is_active for source in self.sources]
 
 
 
@@ -319,11 +344,25 @@ class Graph:
             for source, node_reward_scaling in zip(live_hot_sources, node_reward_scalings):
                 reward[source.id] = energy * node_reward_scaling
 
+            # Gets the indices of the cells used to select which cells were used for node selection when building
+            # the computational graph
             live_selectors = [source.id for source in self.sources if not (source.has_graph)]
-            selector_cell_scalings = tf.gather(distance_scalings, live_selectors, axis=1)
-            tangent_reward_scalings = tf.nn.softmax(tf.gather(selector_cell_scalings, [source.id for source in live_hot_sources]), axis=1)
+            # Compares the distance scalings of the graph nodes to the selector cells
+            # The distance scaling between two cells is 1/(1 + distance)^2
+            selector_cell_scalings = tf.gather(
+                tf.gather(distance_scalings, live_selectors, axis=1),
+                    [source.id for source in live_hot_sources])
+
+            root_scaling_means = tf.expand_dims(tf.reduce_mean(selector_cell_scalings, axis=1), axis=1)
+            root_scaling_stddev = tf.expand_dims(tf.math.reduce_std(selector_cell_scalings, axis=1), axis=1)
+            normalized_selector_cell_scalings = (selector_cell_scalings - root_scaling_means) /root_scaling_stddev
+            # Calculate the percentage each selector cell gets of the reward allocated by each graph node
+            tangent_reward_scalings = tf.nn.softmax(normalized_selector_cell_scalings, axis=1)
+            # Prepares the graph node reward vector for broadcasting
             node_reward_scalings_ext = tf.expand_dims(node_reward_scalings, 1)
+            # Calculates the reward that each selector cell gets based on its proximity to each graph node
             reward_distance_scalings = tf.multiply(node_reward_scalings_ext, tangent_reward_scalings)
+            # Calculates the total reward that each selector cell gets from the entire computational graph
             tangent_rewards = tf.reduce_sum(reward_distance_scalings, axis=0)
             for live_selector_index, tangent_reward in zip(live_selectors, tangent_rewards):
                 reward[live_selector_index] = energy * tangent_reward

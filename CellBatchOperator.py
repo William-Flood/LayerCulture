@@ -269,9 +269,9 @@ def update_scalings(changed_positions, all_positions, old_distance_scalings, sca
         tf.TensorSpec(shape=[None], dtype=tf.int32)
     ]
 )
-def update_positions_and_scalings(state_1, origial_positions, move_gather_arg, updating_indexes, old_distance_scalings, scaling_gather_indices):
+def update_positions_and_scalings(state_1, original_positions, move_gather_arg, updating_indexes, old_distance_scalings, scaling_gather_indices):
     static_and_deltas = tf.concat([tf.zeros([1, 4]), state_1], axis=0)
-    new_positions = origial_positions + tf.gather(static_and_deltas, move_gather_arg, axis=0)
+    new_positions = (original_positions + tf.gather(static_and_deltas, move_gather_arg, axis=0)) % 1.0
     updated_distances = update_distances(tf.gather(new_positions, updating_indexes), new_positions)
     new_distance_scalings = scalings_from_distances(updated_distances, old_distance_scalings, scaling_gather_indices)
     return new_positions, new_distance_scalings

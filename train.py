@@ -10,7 +10,9 @@ from numpy.typing import NDArray
 
 def train(cell_export_data: NDArray, fields_shapes, graph_training_cycles,
                 distance_scalings: NDArray, energy_reward,
-                training_set_file_name, output_queue: Queue, last_golden):
+                training_set_file_name, output_queue: Queue, last_golden,
+                pruning_cycles, cycle_remove_amount, prune_sample_trials,
+                prune_reactivation_amount):
     test_var = tf.constant(6)
     fields = tuple(Field(fields_shape, field_index) for field_index, fields_shape in enumerate(fields_shapes))
     for field in fields:
@@ -20,7 +22,8 @@ def train(cell_export_data: NDArray, fields_shapes, graph_training_cycles,
     training_graph = Graph(cell_export_data, fields, 5, 1000, distance_scalings, last_golden)
     if 0 < len(training_graph.hot_sources):
         output_queue.put("Training")
-        times_array, losses_array, result_graph = training_graph.train(training_set_iter, trainer, graph_training_cycles, 5, .2, .25)
+        times_array, losses_array, result_graph = training_graph.train(
+            training_set_iter, trainer, graph_training_cycles, pruning_cycles, cycle_remove_amount, prune_sample_trials, prune_reactivation_amount)
         output_queue.put(times_array)
         output_queue.put(losses_array)
         output_queue.put(result_graph)

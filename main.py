@@ -28,11 +28,13 @@ def run_loop():
     ]
     # , initial_cell_groups=200
     )
+    simulation_steps = 1000
+    # simulation_steps = 5
     eco.simulate(
-        1000,
+        simulation_steps,
         r"/media/abyssal-dragon/New Volume/ArtAssistData/Records/OriginalIntermediateLayers.tfrecord",
         "/media/abyssal-dragon/New Volume/ArtAssistData/Records/generate_graph.txt",
-        graph_training_cycles=10)
+        energy_reward=2000)
     # eco.test_scaling()
 
 
